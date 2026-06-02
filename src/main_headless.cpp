@@ -64,6 +64,48 @@ enum class ControlMode : int {
 };
 
 // ---------------------------------------------------------------------------
+// SPSC audio ring buffer -- decouples synthesis (60 Hz main loop) from the
+// audio callback (~86 Hz).  Producer: main loop.  Consumer: audio callback.
+// Mirrors the GUI's two-stage model: synthesis -> ring -> hardware callback.
+// ---------------------------------------------------------------------------
+struct AudioRing {
+    static constexpr int kSize = 16384; // power-of-2, ~372 ms at 44100 Hz
+    static constexpr int kMask = kSize - 1;
+
+    int16_t data[kSize] {};
+    std::atomic<int> wIdx { 0 };
+    std::atomic<int> rIdx { 0 };
+
+    int available() const {
+        return (wIdx.load(std::memory_order_acquire) -
+                rIdx.load(std::memory_order_relaxed) + kSize) & kMask;
+    }
+    int freeSlots() const { return kSize - 1 - available(); }
+
+    // Producer only
+    int write(const int16_t *src, int n) {
+        const int free = freeSlots();
+        if (n > free) n = free;
+        const int w = wIdx.load(std::memory_order_relaxed);
+        for (int i = 0; i < n; ++i)
+            data[(w + i) & kMask] = src[i];
+        wIdx.store((w + n) & kMask, std::memory_order_release);
+        return n;
+    }
+
+    // Consumer only
+    int read(int16_t *dst, int n) {
+        const int avail = available();
+        if (n > avail) n = avail;
+        const int r = rIdx.load(std::memory_order_relaxed);
+        for (int i = 0; i < n; ++i)
+            dst[i] = data[(r + i) & kMask];
+        rIdx.store((r + n) & kMask, std::memory_order_release);
+        return n;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Backfire: cross-thread config + lock-free trigger mailbox
 // ---------------------------------------------------------------------------
 struct BackfireCfg {
@@ -132,18 +174,26 @@ struct HeadlessState {
     std::atomic<int>  pendingStarter  { -1 }; // 0=off, 1=on
     std::atomic<int>  pendingGear     { -2 }; // -1=neutral, 0..N=gear (0-indexed); -2=none
 
-    // --- audio diagnostics (written by callback, read by main/status) ---
-    // Accumulated over a rolling window; reset each second by the main loop.
-    // The callback only does relaxed atomic ops -- no locks, no division.
-    std::atomic<float> audioPeak        { 0.0f }; // max |sample| / 32767 in window
-    std::atomic<float> audioRmsSumSq    { 0.0f }; // sum of (sample/32767)^2
-    std::atomic<int>   audioSampleCount { 0 };    // samples accumulated
-    // Snapshot updated by main loop each second from the accumulators above.
-    float snapshotRms  = 0.0f;
-    float snapshotPeak = 0.0f;
-    int   synthBufFill = 0;  // last known synthesizer output buffer fill (samples)
+    // --- audio ring (producer: main loop, consumer: audio callback) ---
+    // The ring decouples 60 Hz synthesis bursts from the ~86 Hz callback.
+    AudioRing audioRing;
 
-    std::atomic<bool>  audioDebug { false }; // print 1-second audio stats to stderr
+    // Samples-read counter updated by the audio callback (atomic for cross-thread read).
+    std::atomic<int> cbSamplesRead { 0 };
+
+    // --- audio diagnostics -- all written by main loop, read by status/debug ---
+    // No atomics needed here; status reads the snapshots which are plain values.
+    // (The main loop is the single writer; status runs from a command thread but
+    //  reads advisory data that can be slightly stale -- that is fine.)
+    float  snapshotRms       = 0.0f;
+    float  snapshotPeak      = 0.0f;
+    int    synthBufFill      = 0;     // synthesizer input-latency buffer samples
+    int    samplesGenPerSec  = 0;     // samples drained from synthesizer last second
+    int    samplesReadPerSec = 0;     // samples consumed by audio callback last second
+    uint32_t audioHash       = 0;     // rolling hash of generated audio (detects loops)
+    float  zeroCrossRate     = 0.0f;  // zero crossings/second (approximates 2x fundamental)
+
+    std::atomic<bool> audioDebug { false };
 };
 
 // ---------------------------------------------------------------------------
@@ -162,7 +212,10 @@ static void triggerBackfire(HeadlessState &state) {
 }
 
 // ---------------------------------------------------------------------------
-// miniaudio callback -- pulls engine audio then mixes synthetic backfire pop
+// miniaudio callback -- reads from the SPSC ring then mixes backfire.
+// The ring is filled by the main loop after each physics frame, exactly
+// mirroring the GUI's two-stage model (synthesis -> ring -> hardware).
+// No mutex, no synthesizer access from this thread.
 // ---------------------------------------------------------------------------
 static void audioCallback(
         ma_device *device, void *output, const void *, ma_uint32 frameCount)
@@ -170,42 +223,19 @@ static void audioCallback(
     HeadlessState *s   = static_cast<HeadlessState *>(device->pUserData);
     int16_t       *out = static_cast<int16_t *>(output);
 
-    const int got = s->sim->readAudioOutput(static_cast<int>(frameCount), out);
+    const int got = s->audioRing.read(out, static_cast<int>(frameCount));
     if (got < static_cast<int>(frameCount)) {
         std::memset(out + got, 0, (frameCount - got) * sizeof(int16_t));
         s->underruns.fetch_add(1, std::memory_order_relaxed);
     }
+    s->cbSamplesRead.fetch_add(got, std::memory_order_relaxed);
 
-    // Accumulate RMS/peak diagnostics over the samples just read from the
-    // synthesizer (before any backfire is mixed in, so we measure engine audio).
-    {
-        float peak = 0.0f;
-        float sumSq = 0.0f;
-        const float scale = 1.0f / 32767.0f;
-        for (int i = 0; i < got; ++i) {
-            const float v = out[i] * scale;
-            const float av = v < 0.0f ? -v : v;
-            if (av > peak) peak = av;
-            sumSq += v * v;
-        }
-        // Relaxed: these are advisory metrics, not safety-critical.
-        float oldPeak = s->audioPeak.load(std::memory_order_relaxed);
-        while (peak > oldPeak &&
-               !s->audioPeak.compare_exchange_weak(
-                   oldPeak, peak, std::memory_order_relaxed)) {}
-        // CAS loop to add to float atomic (no fetch_add for float in C++17)
-        float oldSum = s->audioRmsSumSq.load(std::memory_order_relaxed);
-        while (!s->audioRmsSumSq.compare_exchange_weak(
-                   oldSum, oldSum + sumSq, std::memory_order_relaxed)) {}
-        s->audioSampleCount.fetch_add(got, std::memory_order_relaxed);
-    }
-
+    // Backfire pop mix (unchanged -- no synthesizer access)
     if (!s->backfire.enabled.load(std::memory_order_relaxed))
         return;
 
     BackfireCbState &cb = s->backfireCb;
 
-    // Pick up a pending trigger only when the previous pop has finished.
     if (cb.active == 0) {
         const int pending =
             s->backfire.trigSamples.exchange(0, std::memory_order_acquire);
@@ -213,7 +243,6 @@ static void audioCallback(
             cb.total    = pending;
             cb.active   = pending;
             cb.curAmp   = s->backfire.trigAmplitude.load(std::memory_order_relaxed);
-            // exp(-8/N): amplitude falls to ~0.03% of peak over the full pop duration.
             cb.decayMul = expf(-8.0f / static_cast<float>(pending));
         }
     }
@@ -223,7 +252,6 @@ static void audioCallback(
                                     ? static_cast<ma_uint32>(cb.active)
                                     : frameCount;
         for (ma_uint32 i = 0; i < toPlay; ++i) {
-            // xorshift32 white noise -- no heap, no branches
             cb.rng ^= cb.rng << 13u;
             cb.rng ^= cb.rng >> 17u;
             cb.rng ^= cb.rng <<  5u;
@@ -401,15 +429,20 @@ static void applyCommand(const std::string &line, HeadlessState &state) {
             << "idle_rpm="          << state.idleRpm.load()                      << "\n"
             << "rpm_per_mph="       << state.rpmPerMph.load()                    << "\n"
             << "max_rpm="           << state.maxRpm.load()                       << "\n"
-            << "audio_rms="         << state.snapshotRms                          << "\n"
-            << "audio_peak="        << state.snapshotPeak                         << "\n"
-            << "audio_buf_fill="    << state.synthBufFill                         << "\n"
-            << "audio_leveler_gain="<< state.sim->synthesizer().getLevelerGain()  << "\n"
-            << "backfire="          << (state.backfire.enabled.load()?"on":"off") << "\n"
-            << "backfire_chance="   << state.backfire.chance.load()               << "\n"
-            << "backfire_volume="   << state.backfire.volume.load()               << "\n"
-            << "backfire_count="    << state.backfire.count.load()                << "\n"
-            << "underruns="         << state.underruns.load()                     << "\n"
+            << "audio_rms="              << state.snapshotRms                          << "\n"
+            << "audio_peak="             << state.snapshotPeak                         << "\n"
+            << "audio_hash="             << state.audioHash                             << "\n"
+            << "audio_zcr="              << state.zeroCrossRate                         << "\n"
+            << "audio_leveler_gain="     << state.sim->synthesizer().getLevelerGain()   << "\n"
+            << "samples_gen_per_sec="    << state.samplesGenPerSec                      << "\n"
+            << "samples_read_per_sec="   << state.samplesReadPerSec                     << "\n"
+            << "ring_fill="              << state.audioRing.available()                 << "\n"
+            << "synth_input_buf="        << state.synthBufFill                          << "\n"
+            << "backfire="               << (state.backfire.enabled.load()?"on":"off")  << "\n"
+            << "backfire_chance="        << state.backfire.chance.load()                << "\n"
+            << "backfire_volume="        << state.backfire.volume.load()                << "\n"
+            << "backfire_count="         << state.backfire.count.load()                 << "\n"
+            << "underruns="              << state.underruns.load()                      << "\n"
             << std::flush;
     }
 }
@@ -711,6 +744,14 @@ int main(int argc, char **argv) {
     // Audio diagnostic snapshot -- updated every 1 s
     auto audioSnapEpoch = loopStart;
 
+    // Per-epoch accumulators (main-thread only)
+    int      epochGenSamples = 0;
+    float    epochPeak       = 0.0f;
+    float    epochSumSq      = 0.0f;
+    int      epochZeroCross  = 0;
+    uint32_t epochHash       = 0;
+    int16_t  diagPrevSample  = 0;
+
     engine->setSpeedControl(initThrottle);
 
     while (state.running.load()) {
@@ -802,6 +843,41 @@ int main(int argc, char **argv) {
         stepCount += sim->getFrameIterationCount();
 
         // ------------------------------------------------------------------
+        // Drain synthesizer output into the SPSC ring buffer.
+        // This is the GUI-equivalent step: readAudioOutput() on the main
+        // thread, not the audio callback.  The ring provides headroom so the
+        // callback always has samples even when this runs slower than 86 Hz.
+        // ------------------------------------------------------------------
+        {
+            static int16_t drainBuf[2048];
+            // Pull everything available (up to 2048 per call; loop in case more)
+            int drained;
+            do {
+                drained = sim->readAudioOutput(2048, drainBuf);
+                if (drained > 0) {
+                    state.audioRing.write(drainBuf, drained);
+
+                    // Accumulate diagnostics (main-thread only, no atomics needed)
+                    epochGenSamples += drained;
+                    float pk = 0.0f;
+                    for (int i = 0; i < drained; ++i) {
+                        const float v  = drainBuf[i] * (1.0f / 32767.0f);
+                        const float av = v < 0.0f ? -v : v;
+                        if (av > pk) pk = av;
+                        if (av > epochPeak) epochPeak = av;
+                        epochSumSq += v * v;
+                        if ((drainBuf[i] >= 0) != (diagPrevSample >= 0)) ++epochZeroCross;
+                        diagPrevSample = drainBuf[i];
+                        // Rolling hash -- detects if same audio is repeating
+                        epochHash = (epochHash << 5u) ^ (epochHash >> 27u)
+                                    ^ static_cast<uint32_t>(static_cast<uint16_t>(drainBuf[i]));
+                    }
+                    (void)pk;
+                }
+            } while (drained == 2048); // keep draining if the buffer was full
+        }
+
+        // ------------------------------------------------------------------
         // Backfire trigger detection (uses pedal regardless of mode)
         // ------------------------------------------------------------------
         if (state.backfire.enabled.load(std::memory_order_relaxed)) {
@@ -872,35 +948,47 @@ int main(int argc, char **argv) {
         // Audio diagnostic snapshot -- once per second
         // ------------------------------------------------------------------
         {
-            const auto   now      = Clock::now();
+            const auto   now         = Clock::now();
             const double snapElapsed = Seconds(now - audioSnapEpoch).count();
             if (snapElapsed >= 1.0) {
-                const int   n    = state.audioSampleCount.exchange(0,     std::memory_order_relaxed);
-                const float sumSq= state.audioRmsSumSq.load(              std::memory_order_relaxed);
-                const float pk   = state.audioPeak.load(                   std::memory_order_relaxed);
-                state.audioRmsSumSq.store(0.0f, std::memory_order_relaxed);
-                state.audioPeak.store    (0.0f, std::memory_order_relaxed);
+                const int cbRead = state.cbSamplesRead.exchange(0, std::memory_order_relaxed);
 
-                state.snapshotPeak = pk;
-                state.snapshotRms  = (n > 0) ? std::sqrt(sumSq / static_cast<float>(n)) : 0.0f;
-                // Also snapshot the synthesizer output buffer fill for status.
-                state.synthBufFill = static_cast<int>(
+                state.snapshotRms       = (epochGenSamples > 0)
+                    ? std::sqrt(epochSumSq / static_cast<float>(epochGenSamples)) : 0.0f;
+                state.snapshotPeak      = epochPeak;
+                state.audioHash         = epochHash;
+                state.zeroCrossRate     = (snapElapsed > 0.0)
+                    ? static_cast<float>(epochZeroCross / snapElapsed) : 0.0f;
+                state.samplesGenPerSec  = static_cast<int>(epochGenSamples / snapElapsed);
+                state.samplesReadPerSec = static_cast<int>(cbRead / snapElapsed);
+                state.synthBufFill      = static_cast<int>(
                     sim->getSynthesizerInputLatency() * static_cast<double>(sampleRate));
 
                 if (state.audioDebug.load(std::memory_order_relaxed)) {
                     std::fprintf(stderr,
                         "[AUDIO] rpm=%.0f throttle=%.3f"
-                        " rms=%.4f peak=%.4f leveler_gain=%.4f"
-                        " input_buf=%d underruns=%d\n",
+                        " rms=%.4f peak=%.4f leveler=%.5f"
+                        " gen/s=%d read/s=%d ring=%d zcr=%.0f hash=%08X underruns=%d\n",
                         engine->getRpm(),
                         engine->getThrottle(),
                         state.snapshotRms,
                         state.snapshotPeak,
                         sim->synthesizer().getLevelerGain(),
-                        state.synthBufFill,
+                        state.samplesGenPerSec,
+                        state.samplesReadPerSec,
+                        state.audioRing.available(),
+                        static_cast<double>(state.zeroCrossRate),
+                        state.audioHash,
                         state.underruns.load());
                 }
-                audioSnapEpoch = now;
+
+                // Reset epoch accumulators
+                epochGenSamples = 0;
+                epochPeak       = 0.0f;
+                epochSumSq      = 0.0f;
+                epochZeroCross  = 0;
+                epochHash       = 0;
+                audioSnapEpoch  = now;
             }
         }
 
