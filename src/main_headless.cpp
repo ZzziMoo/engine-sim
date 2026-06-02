@@ -109,9 +109,9 @@ struct AudioRing {
 // Backfire: cross-thread config + lock-free trigger mailbox
 // ---------------------------------------------------------------------------
 struct BackfireCfg {
-    std::atomic<bool>  enabled   { true  };
+    std::atomic<bool>  enabled   { false }; // off by default; enable with "backfire on"
     std::atomic<float> chance    { 0.35f };
-    std::atomic<float> volume    { 0.7f  };
+    std::atomic<float> volume    { 0.25f }; // conservative default
     std::atomic<int>   rpmMin    { 3000  };
     std::atomic<int>   count     { 0     };
 
@@ -124,11 +124,12 @@ struct BackfireCfg {
 
 // Audio-callback-exclusive state -- no atomics needed, only one thread touches it.
 struct BackfireCbState {
-    int      active   = 0;           // remaining samples in current pop
+    int      active   = 0;
     int      total    = 0;
-    float    curAmp   = 0.0f;        // decays each sample
-    float    decayMul = 1.0f;        // per-sample multiplier: exp(-k/total)
-    uint32_t rng      = 0xCAFEBABEu; // xorshift32 for white noise
+    float    curAmp   = 0.0f;        // decays each sample via decayMul
+    float    decayMul = 1.0f;        // exp(-k/total), computed once at trigger
+    float    lpState  = 0.0f;        // one-pole lowpass state (~2 kHz) softens noise
+    uint32_t rng      = 0xCAFEBABEu;
 };
 
 // ---------------------------------------------------------------------------
@@ -164,12 +165,23 @@ struct HeadlessState {
     BackfireCbState backfireCb;         // audio callback exclusive
     std::atomic<int> backfireEpochCount { 0 }; // reset each benchmark interval
 
+    // --- RPM PI controller (rpm mode) ---
+    // DirectThrottleLinkage is NOT a direct RPM setter. A PI controller
+    // adjusts setSpeedControl each frame so actual RPM tracks targetRpm.
+    std::atomic<double> rpmKp { 0.3 };  // proportional gain (normalized units)
+    std::atomic<double> rpmKi { 0.1 };  // integral gain (/s)
+    std::atomic<double> rpmKd { 0.0 };  // derivative gain (future use)
+
+    // --- sweep_rpm: linear RPM ramp for audible testing ---
+    std::atomic<double> sweepFromRpm { 0.0 };
+    std::atomic<double> sweepToRpm   { 0.0 };
+    std::atomic<double> sweepSeconds { 0.0 };
+    std::atomic<bool>   sweepTrigger { false }; // set by command, cleared by main loop
+
     // --- startup / gear ---
-    std::atomic<bool> autostart      { true };  // perform ignition+starter on launch
+    std::atomic<bool> autostart      { true };
 
     // Pending one-shot commands dispatched to main thread each frame.
-    // Sentinel -1 = no change pending; avoids touching engine objects from
-    // command threads while physics may be running on the main thread.
     std::atomic<int>  pendingIgnition { -1 }; // 0=off, 1=on
     std::atomic<int>  pendingStarter  { -1 }; // 0=off, 1=on
     std::atomic<int>  pendingGear     { -2 }; // -1=neutral, 0..N=gear (0-indexed); -2=none
@@ -243,7 +255,9 @@ static void audioCallback(
             cb.total    = pending;
             cb.active   = pending;
             cb.curAmp   = s->backfire.trigAmplitude.load(std::memory_order_relaxed);
-            cb.decayMul = expf(-8.0f / static_cast<float>(pending));
+            // k=10: amplitude is ~0.005% of peak at end -- sharp transient
+            cb.decayMul = expf(-10.0f / static_cast<float>(pending));
+            cb.lpState  = 0.0f;
         }
     }
 
@@ -255,11 +269,12 @@ static void audioCallback(
             cb.rng ^= cb.rng << 13u;
             cb.rng ^= cb.rng >> 17u;
             cb.rng ^= cb.rng <<  5u;
-            const float noise = static_cast<float>(cb.rng) *
-                                 (1.0f / 4294967296.0f) * 2.0f - 1.0f;
-
+            const float raw = static_cast<float>(cb.rng) *
+                               (1.0f / 4294967296.0f) * 2.0f - 1.0f;
+            // One-pole lowpass at ~2 kHz: warms the noise into a softer crack
+            cb.lpState = 0.25f * raw + 0.75f * cb.lpState;
             cb.curAmp *= cb.decayMul;
-            const float pop  = noise * cb.curAmp;
+            const float pop  = cb.lpState * cb.curAmp;
             const float eng  = out[i] * (1.0f / 32767.0f);
             float mixed = eng + pop;
             if (mixed >  1.0f) mixed =  1.0f;
@@ -317,8 +332,12 @@ static void applyCommand(const std::string &line, HeadlessState &state) {
         if (!(ss >> sub)) return;
         if      (sub == "throttle")
             state.mode.store((int)ControlMode::Throttle, std::memory_order_relaxed);
-        else if (sub == "rpm")
-            state.mode.store((int)ControlMode::Rpm,      std::memory_order_relaxed);
+        else if (sub == "rpm") {
+            state.mode.store((int)ControlMode::Rpm, std::memory_order_relaxed);
+            // Neutral removes vehicle inertia so PI controller can reach
+            // any target RPM within a few seconds.
+            state.pendingGear.store(-1, std::memory_order_relaxed);
+        }
         else if (sub == "hybrid")
             state.mode.store((int)ControlMode::Hybrid,   std::memory_order_relaxed);
 
@@ -333,6 +352,27 @@ static void applyCommand(const std::string &line, HeadlessState &state) {
     } else if (cmd == "max_rpm") {
         double v = 8000.0;
         if (ss >> v) state.maxRpm.store(clampPos(v), std::memory_order_relaxed);
+
+    } else if (cmd == "rpm_kp") {
+        double v = 0.5;
+        if (ss >> v) state.rpmKp.store(clampPos(v), std::memory_order_relaxed);
+
+    } else if (cmd == "rpm_ki") {
+        double v = 0.2;
+        if (ss >> v) state.rpmKi.store(clampPos(v), std::memory_order_relaxed);
+
+    } else if (cmd == "rpm_kd") {
+        double v = 0.0;
+        if (ss >> v) state.rpmKd.store(clampPos(v), std::memory_order_relaxed);
+
+    } else if (cmd == "sweep_rpm") {
+        double lo = 1000.0, hi = 6000.0, secs = 8.0;
+        if (ss >> lo >> hi >> secs) {
+            state.sweepFromRpm.store(std::max(0.0, lo),   std::memory_order_relaxed);
+            state.sweepToRpm.store  (std::max(0.0, hi),   std::memory_order_relaxed);
+            state.sweepSeconds.store(std::max(1.0, secs), std::memory_order_relaxed);
+            state.sweepTrigger.store(true, std::memory_order_release);
+        }
 
     } else if (cmd == "backfire") {
         std::string sub;
@@ -426,6 +466,8 @@ static void applyCommand(const std::string &line, HeadlessState &state) {
             << "engine_rpm="        << rpm                                        << "\n"
             << "crankshaft_rpm="    << crankRpm                                   << "\n"
             << "target_rpm="        << state.targetRpm.load()                    << "\n"
+            << "rpm_kp="            << state.rpmKp.load()                        << "\n"
+            << "rpm_ki="            << state.rpmKi.load()                        << "\n"
             << "idle_rpm="          << state.idleRpm.load()                      << "\n"
             << "rpm_per_mph="       << state.rpmPerMph.load()                    << "\n"
             << "max_rpm="           << state.maxRpm.load()                       << "\n"
@@ -736,10 +778,19 @@ int main(int argc, char **argv) {
 
     // Backfire trigger state (main-thread only -- no atomics needed)
     double prevPedal  = 0.0;
-    double bfCooldown = 0.0; // seconds until next backfire is eligible
+    double bfCooldown = 0.0;
 
-    // Autostart state: track whether the starter has been released yet
+    // Autostart state
     bool starterReleased = !state.autostart.load();
+
+    // RPM PI controller state (main-thread only)
+    double rpmIntegral  = 0.0;
+    double rpmPrevError = 0.0;
+
+    // sweep_rpm state (main-thread only)
+    bool   sweepActive = false;
+    double sweepFrom   = 0.0, sweepTo = 0.0, sweepDur = 0.0;
+    Clock::time_point sweepStart = loopStart;
 
     // Audio diagnostic snapshot -- updated every 1 s
     auto audioSnapEpoch = loopStart;
@@ -788,12 +839,42 @@ int main(int argc, char **argv) {
         }
 
         // ------------------------------------------------------------------
-        // Compute setSpeedControl value from active mode.
+        // sweep_rpm: linearly ramp targetRpm, auto-switches to rpm mode
+        // ------------------------------------------------------------------
+        if (state.sweepTrigger.exchange(false, std::memory_order_acquire)) {
+            sweepFrom  = state.sweepFromRpm.load(std::memory_order_relaxed);
+            sweepTo    = state.sweepToRpm.load(std::memory_order_relaxed);
+            sweepDur   = state.sweepSeconds.load(std::memory_order_relaxed);
+            sweepStart = frameStart;
+            sweepActive  = true;
+            rpmIntegral  = 0.0;
+            rpmPrevError = 0.0;
+            state.mode.store((int)ControlMode::Rpm, std::memory_order_relaxed);
+            // Neutral removes vehicle inertia: engine reaches target RPM in ~3 s
+            sim->getTransmission()->changeGear(-1);
+            std::cerr << "[headless] Sweep: " << sweepFrom << " -> "
+                      << sweepTo << " RPM over " << sweepDur << "s (gear: neutral)\n";
+        }
+        if (sweepActive) {
+            const double t = Seconds(frameStart - sweepStart).count();
+            if (t >= sweepDur) {
+                state.targetRpm.store(sweepTo, std::memory_order_relaxed);
+                sweepActive = false;
+                std::cerr << "[headless] Sweep complete\n";
+            } else {
+                const double frac = t / sweepDur;
+                state.targetRpm.store(
+                    sweepFrom + (sweepTo - sweepFrom) * frac,
+                    std::memory_order_relaxed);
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Compute setSpeedControl from active mode.
         //
-        // DirectThrottleLinkage maps setSpeedControl(s) as:
-        //   s=0 -> throttle_position=1 -> full throttle
-        //   s=1 -> throttle_position=0 -> idle
-        // So pedal 0-100 maps to s = 1 - pedal/100.
+        // DirectThrottleLinkage: s=0 -> full throttle, s=1 -> idle.
+        // rpm mode uses a PI controller so the engine actually reaches the
+        // target RPM instead of just mapping it through a static formula.
         // ------------------------------------------------------------------
         const ControlMode mode     = static_cast<ControlMode>(
                                         state.mode.load(std::memory_order_relaxed));
@@ -805,13 +886,38 @@ int main(int argc, char **argv) {
         const double maxRpm        = state.maxRpm.load(std::memory_order_relaxed);
         const double rpmSpan       = maxRpm - idleRpm;
 
+        // Reset PI integrator whenever we enter rpm mode from a different mode.
+        {
+            static ControlMode prevMode = ControlMode::Hybrid;
+            if (mode == ControlMode::Rpm && prevMode != ControlMode::Rpm) {
+                rpmIntegral  = 0.0;
+                rpmPrevError = 0.0;
+            }
+            prevMode = mode;
+        }
+
         double sc;
         switch (mode) {
             case ControlMode::Rpm: {
-                const double tRpm = state.targetRpm.load(std::memory_order_relaxed);
-                sc = (rpmSpan > 0.0)
+                const double tRpm    = state.targetRpm.load(std::memory_order_relaxed);
+                const double aRpm    = engine->getRpm();
+                const double kp      = state.rpmKp.load(std::memory_order_relaxed);
+                const double ki      = state.rpmKi.load(std::memory_order_relaxed);
+                const double kd      = state.rpmKd.load(std::memory_order_relaxed);
+                // Error normalised to [−1..+1] over the full RPM span.
+                const double errNorm = (rpmSpan > 0.0)
+                    ? (tRpm - aRpm) / rpmSpan : 0.0;
+                // PI(D): positive error -> need more RPM -> decrease sc (open throttle)
+                rpmIntegral  = std::max(-0.5, std::min(0.5,
+                                   rpmIntegral + ki * errNorm * wallDt));
+                const double dTerm   = kd * (errNorm - rpmPrevError) / wallDt;
+                rpmPrevError = errNorm;
+                // Feedforward from target + closed-loop correction
+                const double sc_ff   = (rpmSpan > 0.0)
                     ? std::max(0.0, std::min(1.0, 1.0 - (tRpm - idleRpm) / rpmSpan))
                     : 0.5;
+                sc = std::max(0.0, std::min(1.0,
+                         sc_ff - kp * errNorm - rpmIntegral - dTerm));
                 break;
             }
             case ControlMode::Hybrid: {
@@ -833,6 +939,27 @@ int main(int argc, char **argv) {
                 break;
         }
         engine->setSpeedControl(sc);
+
+        // ------------------------------------------------------------------
+        // rpm mode: directly enforce crankshaft angular velocity so that
+        // audio pitch tracks targetRpm immediately.
+        //
+        // Engine-sim's RotationFrictionConstraint resists angular changes but
+        // does NOT actively decelerate the engine -- a coasting engine with
+        // closed throttle maintains RPM indefinitely.  Directly setting v_theta
+        // before each physics step forces combustion to run at the correct
+        // frequency, producing genuinely synthesized audio at that RPM.
+        // The PI controller still drives throttle for realistic combustion.
+        // ------------------------------------------------------------------
+        if (mode == ControlMode::Rpm && engine->getCrankshaftCount() > 0) {
+            constexpr double kRpmToRad = 2.0 * 3.14159265358979323846 / 60.0;
+            const double tRpm   = state.targetRpm.load(std::memory_order_relaxed);
+            const double tOmega = std::max(0.0, tRpm) * kRpmToRad;
+            Crankshaft   *cs    = engine->getCrankshaft(0);
+            // Preserve rotation direction; Honda TRX520 spins CW (negative v_theta)
+            const double sign   = (cs->m_body.v_theta <= 0.0) ? -1.0 : 1.0;
+            cs->m_body.v_theta  = sign * tOmega;
+        }
 
         // ------------------------------------------------------------------
         // Physics step
