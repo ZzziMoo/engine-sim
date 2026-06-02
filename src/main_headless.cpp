@@ -131,6 +131,19 @@ struct HeadlessState {
     std::atomic<int>  pendingIgnition { -1 }; // 0=off, 1=on
     std::atomic<int>  pendingStarter  { -1 }; // 0=off, 1=on
     std::atomic<int>  pendingGear     { -2 }; // -1=neutral, 0..N=gear (0-indexed); -2=none
+
+    // --- audio diagnostics (written by callback, read by main/status) ---
+    // Accumulated over a rolling window; reset each second by the main loop.
+    // The callback only does relaxed atomic ops -- no locks, no division.
+    std::atomic<float> audioPeak        { 0.0f }; // max |sample| / 32767 in window
+    std::atomic<float> audioRmsSumSq    { 0.0f }; // sum of (sample/32767)^2
+    std::atomic<int>   audioSampleCount { 0 };    // samples accumulated
+    // Snapshot updated by main loop each second from the accumulators above.
+    float snapshotRms  = 0.0f;
+    float snapshotPeak = 0.0f;
+    int   synthBufFill = 0;  // last known synthesizer output buffer fill (samples)
+
+    std::atomic<bool>  audioDebug { false }; // print 1-second audio stats to stderr
 };
 
 // ---------------------------------------------------------------------------
@@ -161,6 +174,30 @@ static void audioCallback(
     if (got < static_cast<int>(frameCount)) {
         std::memset(out + got, 0, (frameCount - got) * sizeof(int16_t));
         s->underruns.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Accumulate RMS/peak diagnostics over the samples just read from the
+    // synthesizer (before any backfire is mixed in, so we measure engine audio).
+    {
+        float peak = 0.0f;
+        float sumSq = 0.0f;
+        const float scale = 1.0f / 32767.0f;
+        for (int i = 0; i < got; ++i) {
+            const float v = out[i] * scale;
+            const float av = v < 0.0f ? -v : v;
+            if (av > peak) peak = av;
+            sumSq += v * v;
+        }
+        // Relaxed: these are advisory metrics, not safety-critical.
+        float oldPeak = s->audioPeak.load(std::memory_order_relaxed);
+        while (peak > oldPeak &&
+               !s->audioPeak.compare_exchange_weak(
+                   oldPeak, peak, std::memory_order_relaxed)) {}
+        // CAS loop to add to float atomic (no fetch_add for float in C++17)
+        float oldSum = s->audioRmsSumSq.load(std::memory_order_relaxed);
+        while (!s->audioRmsSumSq.compare_exchange_weak(
+                   oldSum, oldSum + sumSq, std::memory_order_relaxed)) {}
+        s->audioSampleCount.fetch_add(got, std::memory_order_relaxed);
     }
 
     if (!s->backfire.enabled.load(std::memory_order_relaxed))
@@ -318,6 +355,11 @@ static void applyCommand(const std::string &line, HeadlessState &state) {
         if (ss >> sub)
             state.autostart.store(sub == "on", std::memory_order_relaxed);
 
+    } else if (cmd == "audio_debug") {
+        std::string sub;
+        if (ss >> sub)
+            state.audioDebug.store(sub == "on", std::memory_order_relaxed);
+
     } else if (cmd == "quit") {
         state.running.store(false, std::memory_order_relaxed);
 
@@ -328,35 +370,46 @@ static void applyCommand(const std::string &line, HeadlessState &state) {
             case ControlMode::Hybrid: modeStr = "hybrid"; break;
             default: break;
         }
-        const double rpm      = state.engine ? state.engine->getRpm() : 0.0;
-        const bool   ignition = state.engine
+        const double rpm        = state.engine ? state.engine->getRpm() : 0.0;
+        const double crankRpm   = state.engine && state.engine->getCrankshaftCount() > 0
+            ? std::abs(units::toRpm(state.engine->getCrankshaft(0)->m_body.v_theta))
+            : 0.0;
+        const double throttlePos = state.engine
+            ? state.engine->getThrottle() : 0.0;
+        const bool   ignition   = state.engine
             ? state.engine->getIgnitionModule()->m_enabled : false;
-        const bool   starter  = state.sim
+        const bool   starter    = state.sim
             ? state.sim->m_starterMotor.m_enabled : false;
-        const int    gearApi  = state.sim
+        const int    gearApi    = state.sim
             ? state.sim->getTransmission()->getGear() : -1;
         const std::string gearStr = (gearApi == -1)
             ? "N" : std::to_string(gearApi + 1);
 
         std::cout
-            << "mode="           << modeStr                                   << "\n"
-            << "ignition="       << (ignition ? "on" : "off")                 << "\n"
-            << "starter="        << (starter  ? "on" : "off")                 << "\n"
-            << "gear="           << gearStr                                    << "\n"
-            << "throttle="       << state.throttle.load()                     << "\n"
-            << "pedal="          << state.pedal.load()                        << "\n"
-            << "brake="          << state.brake.load()                        << "\n"
-            << "speed_mph="      << state.speedMph.load()                     << "\n"
-            << "rpm="            << rpm                                        << "\n"
-            << "target_rpm="     << state.targetRpm.load()                    << "\n"
-            << "idle_rpm="       << state.idleRpm.load()                      << "\n"
-            << "rpm_per_mph="    << state.rpmPerMph.load()                    << "\n"
-            << "max_rpm="        << state.maxRpm.load()                       << "\n"
-            << "backfire="       << (state.backfire.enabled.load()?"on":"off") << "\n"
-            << "backfire_chance="<< state.backfire.chance.load()              << "\n"
-            << "backfire_volume="<< state.backfire.volume.load()              << "\n"
-            << "backfire_count=" << state.backfire.count.load()               << "\n"
-            << "underruns="      << state.underruns.load()                    << "\n"
+            << "mode="              << modeStr                                   << "\n"
+            << "ignition="          << (ignition ? "on" : "off")                 << "\n"
+            << "starter="           << (starter  ? "on" : "off")                 << "\n"
+            << "gear="              << gearStr                                    << "\n"
+            << "throttle_sc="       << state.throttle.load()                     << "\n"
+            << "throttle_position=" << throttlePos                                << "\n"
+            << "pedal="             << state.pedal.load()                        << "\n"
+            << "brake="             << state.brake.load()                        << "\n"
+            << "speed_mph="         << state.speedMph.load()                     << "\n"
+            << "engine_rpm="        << rpm                                        << "\n"
+            << "crankshaft_rpm="    << crankRpm                                   << "\n"
+            << "target_rpm="        << state.targetRpm.load()                    << "\n"
+            << "idle_rpm="          << state.idleRpm.load()                      << "\n"
+            << "rpm_per_mph="       << state.rpmPerMph.load()                    << "\n"
+            << "max_rpm="           << state.maxRpm.load()                       << "\n"
+            << "audio_rms="         << state.snapshotRms                          << "\n"
+            << "audio_peak="        << state.snapshotPeak                         << "\n"
+            << "audio_buf_fill="    << state.synthBufFill                         << "\n"
+            << "audio_leveler_gain="<< state.sim->synthesizer().getLevelerGain()  << "\n"
+            << "backfire="          << (state.backfire.enabled.load()?"on":"off") << "\n"
+            << "backfire_chance="   << state.backfire.chance.load()               << "\n"
+            << "backfire_volume="   << state.backfire.volume.load()               << "\n"
+            << "backfire_count="    << state.backfire.count.load()                << "\n"
+            << "underruns="         << state.underruns.load()                     << "\n"
             << std::flush;
     }
 }
@@ -655,6 +708,9 @@ int main(int argc, char **argv) {
     // Autostart state: track whether the starter has been released yet
     bool starterReleased = !state.autostart.load();
 
+    // Audio diagnostic snapshot -- updated every 1 s
+    auto audioSnapEpoch = loopStart;
+
     engine->setSpeedControl(initThrottle);
 
     while (state.running.load()) {
@@ -809,6 +865,42 @@ int main(int argc, char **argv) {
 
                 benchEpoch = now;
                 stepCount  = 0;
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Audio diagnostic snapshot -- once per second
+        // ------------------------------------------------------------------
+        {
+            const auto   now      = Clock::now();
+            const double snapElapsed = Seconds(now - audioSnapEpoch).count();
+            if (snapElapsed >= 1.0) {
+                const int   n    = state.audioSampleCount.exchange(0,     std::memory_order_relaxed);
+                const float sumSq= state.audioRmsSumSq.load(              std::memory_order_relaxed);
+                const float pk   = state.audioPeak.load(                   std::memory_order_relaxed);
+                state.audioRmsSumSq.store(0.0f, std::memory_order_relaxed);
+                state.audioPeak.store    (0.0f, std::memory_order_relaxed);
+
+                state.snapshotPeak = pk;
+                state.snapshotRms  = (n > 0) ? std::sqrt(sumSq / static_cast<float>(n)) : 0.0f;
+                // Also snapshot the synthesizer output buffer fill for status.
+                state.synthBufFill = static_cast<int>(
+                    sim->getSynthesizerInputLatency() * static_cast<double>(sampleRate));
+
+                if (state.audioDebug.load(std::memory_order_relaxed)) {
+                    std::fprintf(stderr,
+                        "[AUDIO] rpm=%.0f throttle=%.3f"
+                        " rms=%.4f peak=%.4f leveler_gain=%.4f"
+                        " input_buf=%d underruns=%d\n",
+                        engine->getRpm(),
+                        engine->getThrottle(),
+                        state.snapshotRms,
+                        state.snapshotPeak,
+                        sim->synthesizer().getLevelerGain(),
+                        state.synthBufFill,
+                        state.underruns.load());
+                }
+                audioSnapEpoch = now;
             }
         }
 
