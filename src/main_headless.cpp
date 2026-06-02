@@ -5,9 +5,23 @@
 // Build:  cmake -B build -DHEADLESS=ON -DDISCORD_ENABLED=OFF
 // Usage:  engine-sim-headless --script assets/engines/.../engine.mr
 //             [--port 9999] [--throttle 0.5] [--benchmark]
-//             [--sample-rate 44100]
+//             [--sample-rate 44100] [--period 512]
+//             [--write-wav out.wav] [--wav-seconds 30]
+//             [--no-audio-device]
+//
+// Diagnostic flags:
+//   --write-wav out.wav   capture synthesis output to a WAV file
+//   --wav-seconds 30      WAV duration (default 30 s), then exit
+//   --no-audio-device     render to WAV only, no speaker output
+//   --period 512|1024|2048  miniaudio period size (default 512)
+//
+// Commands:  tone <Hz>|off   -- replace engine audio with a pure sine wave
 
 #define NOMINMAX
+#define _CRT_SECURE_NO_WARNINGS
+#ifndef M_PI
+#  define M_PI 3.14159265358979323846
+#endif
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 
@@ -26,6 +40,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -56,15 +71,13 @@ static double processCpuSeconds() { return -1.0; }
 // Control mode
 // ---------------------------------------------------------------------------
 enum class ControlMode : int {
-    Throttle = 0,   // throttle <0-1> passes directly to setSpeedControl
-    Rpm      = 1,   // setrpm <value>; maps to setSpeedControl, no forcing
-    Hybrid   = 2    // speed + virtual gear table sets targetRpm -> setSpeedControl
+    Throttle = 0,
+    Rpm      = 1,
+    Hybrid   = 2
 };
 
 // ---------------------------------------------------------------------------
-// Virtual gear table -- used in Hybrid mode as a pure RPM calculator.
-// Calculates targetRpm from vehicle speed; drives setSpeedControl only.
-// No crankshaft.v_theta forcing at any point.
+// Virtual gear table -- Hybrid mode RPM calculator (no v_theta forcing)
 // ---------------------------------------------------------------------------
 struct VGear { double minMph, maxMph, minRpm, maxRpm; };
 static const VGear kVGears[5] = {
@@ -74,11 +87,8 @@ static const VGear kVGears[5] = {
     { 65.0, 105.0, 2500.0, 4800.0 },
     { 90.0, 130.0, 2500.0, 4200.0 },
 };
-// Per-gear upshift trigger offset (mph below gear.maxMph).
-// Negative = trigger earlier, positive = later.
 static const double kUpshiftOffsetMph[5] = { -8.0, -5.0, -5.0, -5.0, -5.0 };
 
-// Interpolate RPM within a gear given current speed.
 static double vGearRpm(int gear, double speedMph) {
     const VGear &g = kVGears[gear - 1];
     const double span = g.maxMph - g.minMph;
@@ -89,12 +99,74 @@ static double vGearRpm(int gear, double speedMph) {
 }
 
 // ---------------------------------------------------------------------------
+// WAV writer -- captures PCM int16 mono to a file for offline analysis.
+// open() writes a placeholder header; close() patches it with final sizes.
+// ---------------------------------------------------------------------------
+struct WavWriter {
+    FILE    *f              = nullptr;
+    int      sampleRate     = 44100;
+    uint32_t samplesWritten = 0;
+
+    bool open(const char *path, int sr) {
+        sampleRate = sr;
+        f = std::fopen(path, "wb");
+        if (!f) return false;
+        // 44-byte placeholder; patched by close()
+        uint8_t hdr[44] = {};
+        std::fwrite(hdr, 1, 44, f);
+        samplesWritten = 0;
+        return true;
+    }
+
+    void write(const int16_t *data, int n) {
+        if (!f || n <= 0) return;
+        std::fwrite(data, sizeof(int16_t), static_cast<size_t>(n), f);
+        samplesWritten += static_cast<uint32_t>(n);
+    }
+
+    void close() {
+        if (!f) return;
+        const uint32_t dataBytes = samplesWritten * 2;
+        const uint32_t riffSize  = 36 + dataBytes;
+        const uint32_t byteRate  = static_cast<uint32_t>(sampleRate) * 2;
+
+        uint8_t hdr[44];
+        auto wr2 = [&](int off, uint16_t v) {
+            hdr[off] = v & 0xFF; hdr[off+1] = (v >> 8) & 0xFF;
+        };
+        auto wr4 = [&](int off, uint32_t v) {
+            hdr[off]=v&0xFF; hdr[off+1]=(v>>8)&0xFF;
+            hdr[off+2]=(v>>16)&0xFF; hdr[off+3]=(v>>24)&0xFF;
+        };
+        hdr[0]='R'; hdr[1]='I'; hdr[2]='F'; hdr[3]='F';
+        wr4(4,  riffSize);
+        hdr[8]='W'; hdr[9]='A'; hdr[10]='V'; hdr[11]='E';
+        hdr[12]='f'; hdr[13]='m'; hdr[14]='t'; hdr[15]=' ';
+        wr4(16, 16);          // fmt chunk size
+        wr2(20, 1);           // PCM
+        wr2(22, 1);           // mono
+        wr4(24, static_cast<uint32_t>(sampleRate));
+        wr4(28, byteRate);
+        wr2(32, 2);           // block align
+        wr2(34, 16);          // bits per sample
+        hdr[36]='d'; hdr[37]='a'; hdr[38]='t'; hdr[39]='a';
+        wr4(40, dataBytes);
+
+        std::rewind(f);
+        std::fwrite(hdr, 1, 44, f);
+        std::fclose(f);
+        f = nullptr;
+    }
+
+    bool isOpen() const { return f != nullptr; }
+    ~WavWriter() { close(); }
+};
+
+// ---------------------------------------------------------------------------
 // SPSC audio ring -- decouples 60 Hz synthesis from ~86 Hz audio callback.
-// Producer: main loop (after each endFrame). Consumer: audio callback.
-// Mirrors the GUI two-stage model: synthesis -> ring -> hardware callback.
 // ---------------------------------------------------------------------------
 struct AudioRing {
-    static constexpr int kSize = 16384; // ~372 ms at 44100 Hz
+    static constexpr int kSize = 16384;
     static constexpr int kMask = kSize - 1;
 
     int16_t data[kSize] {};
@@ -107,7 +179,6 @@ struct AudioRing {
     }
     int freeSlots() const { return kSize - 1 - available(); }
 
-    // Producer only
     int write(const int16_t *src, int n) {
         const int free = freeSlots();
         if (n > free) n = free;
@@ -118,7 +189,6 @@ struct AudioRing {
         return n;
     }
 
-    // Consumer only
     int read(int16_t *dst, int n) {
         const int avail = available();
         if (n > avail) n = avail;
@@ -141,55 +211,52 @@ struct HeadlessState {
     std::atomic<int>  underruns { 0 };
     std::atomic<bool> running   { true };
 
-    // Throttle mode (legacy pass-through): 0=full throttle, 1=idle
     std::atomic<double> throttle { 0.5 };
 
-    // Extended EV/CAN inputs
     std::atomic<int>    mode     { (int)ControlMode::Throttle };
-    std::atomic<double> pedal    { 0.0 };    // 0-100
-    std::atomic<double> brake    { 0.0 };    // 0-1
+    std::atomic<double> pedal    { 0.0 };
+    std::atomic<double> brake    { 0.0 };
     std::atomic<double> speedMph { 0.0 };
-    std::atomic<double> targetRpm{ 900.0 };  // computed by hybrid/rpm modes
+    std::atomic<double> targetRpm{ 900.0 };
 
-    // RPM mapping parameters (used by Rpm and Hybrid modes)
     std::atomic<double> idleRpm  { 900.0  };
     std::atomic<double> maxRpm   { 8000.0 };
 
-    // Virtual gear state (Hybrid mode only)
     std::atomic<int>    vGearCurrent { 1  };
-    std::atomic<int>    vGearManual  { -1 }; // -1 = auto
+    std::atomic<int>    vGearManual  { -1 };
 
-    // Startup
     std::atomic<bool> autostart       { true };
-    std::atomic<int>  pendingIgnition { -1 }; // 0=off, 1=on; -1=none
-    std::atomic<int>  pendingStarter  { -1 }; // 0=off, 1=on; -1=none
-    std::atomic<int>  pendingGear     { -2 }; // -1=neutral, 0..N=gear; -2=none
+    std::atomic<int>  pendingIgnition { -1 };
+    std::atomic<int>  pendingStarter  { -1 };
+    std::atomic<int>  pendingGear     { -2 };
 
-    // Backfire config -- audio layer not yet implemented (Step 5)
     std::atomic<bool>  backfireEnabled { false };
     std::atomic<float> backfireChance  { 0.35f };
     std::atomic<float> backfireVolume  { 0.7f  };
     std::atomic<int>   backfireRpmMin  { 3000  };
 
-    // Audio ring (main loop -> callback)
+    // Tone generator (replaces engine audio when active)
+    std::atomic<bool>   toneActive { false };
+    std::atomic<double> toneFreq   { 440.0 };
+
     AudioRing audioRing;
     std::atomic<int> cbSamplesRead { 0 };
 
-    // Audio diagnostic snapshots (written by main loop, read by status)
-    float    snapshotRms       = 0.0f;
-    float    snapshotPeak      = 0.0f;
-    int      synthBufFill      = 0;
-    int      samplesGenPerSec  = 0;
-    int      samplesReadPerSec = 0;
-    uint32_t audioHash         = 0;
-    float    zeroCrossRate     = 0.0f;
+    // Diagnostic snapshots (written by main loop)
+    float    snapshotRms        = 0.0f;
+    float    snapshotPeak       = 0.0f;
+    int      synthBufFill       = 0;
+    int      samplesGenPerSec   = 0;
+    int      samplesReadPerSec  = 0;
+    uint32_t audioHash          = 0;
+    float    zeroCrossRate      = 0.0f;
+    int      synthClipsPerSec   = 0; // synth output samples at INT16 ceiling/floor
 
     std::atomic<bool> audioDebug { false };
 };
 
 // ---------------------------------------------------------------------------
-// miniaudio callback -- reads from the SPSC ring only.
-// No synthesizer access, no backfire mixing (audio layer not yet added).
+// miniaudio callback -- reads from SPSC ring only, no synthesizer access
 // ---------------------------------------------------------------------------
 static void audioCallback(
         ma_device *device, void *output, const void *, ma_uint32 frameCount)
@@ -206,7 +273,7 @@ static void audioCallback(
 }
 
 // ---------------------------------------------------------------------------
-// Command parser -- shared by stdin and UDP threads
+// Command parser
 // ---------------------------------------------------------------------------
 static void applyCommand(const std::string &line, HeadlessState &state) {
     std::istringstream ss(line);
@@ -258,13 +325,11 @@ static void applyCommand(const std::string &line, HeadlessState &state) {
     } else if (cmd == "gear") {
         int n = 1;
         if (ss >> n) {
-            // User: 0=neutral, 1..5=gear. API: -1=neutral, 0..N-1=gear.
             const int apiGear = (n <= 0) ? -1 : n - 1;
             state.pendingGear.store(apiGear, std::memory_order_relaxed);
         }
 
     } else if (cmd == "vgear") {
-        // Manual virtual gear override: 0=auto, 1-5=forced gear
         int n = 0;
         if (ss >> n) state.vGearManual.store(n, std::memory_order_relaxed);
 
@@ -283,8 +348,25 @@ static void applyCommand(const std::string &line, HeadlessState &state) {
         if (ss >> sub)
             state.autostart.store(sub == "on", std::memory_order_relaxed);
 
+    } else if (cmd == "tone") {
+        // "tone 440" -- replace engine audio with pure sine at given Hz
+        // "tone off" -- restore engine audio
+        std::string sub;
+        if (!(ss >> sub)) return;
+        if (sub == "off") {
+            state.toneActive.store(false, std::memory_order_relaxed);
+            std::cerr << "[headless] Tone: off (engine audio restored)\n";
+        } else {
+            double freq = 440.0;
+            try { freq = std::stod(sub); } catch (...) {}
+            if (freq > 0.0) {
+                state.toneFreq.store(freq, std::memory_order_relaxed);
+                state.toneActive.store(true, std::memory_order_relaxed);
+                std::cerr << "[headless] Tone: " << freq << " Hz\n";
+            }
+        }
+
     } else if (cmd == "backfire") {
-        // Audio layer not yet implemented; accept config commands for future use.
         std::string sub;
         if (!(ss >> sub)) return;
         if      (sub == "on")  state.backfireEnabled.store(true,  std::memory_order_relaxed);
@@ -303,7 +385,6 @@ static void applyCommand(const std::string &line, HeadlessState &state) {
             int v = 3000;
             if (ss >> v) state.backfireRpmMin.store(v < 0 ? 0 : v, std::memory_order_relaxed);
         }
-        // "backfire test" is a no-op until Step 5
 
     } else if (cmd == "audio_debug") {
         std::string sub;
@@ -347,6 +428,8 @@ static void applyCommand(const std::string &line, HeadlessState &state) {
             << "idle_rpm="           << state.idleRpm.load()                        << "\n"
             << "max_rpm="            << state.maxRpm.load()                         << "\n"
             << "vgear="              << state.vGearCurrent.load()                   << "\n"
+            << "tone="               << (state.toneActive.load() ? "on" : "off")    << "\n"
+            << "tone_freq="          << state.toneFreq.load()                       << "\n"
             << "audio_rms="          << state.snapshotRms                            << "\n"
             << "audio_peak="         << state.snapshotPeak                           << "\n"
             << "audio_hash="         << state.audioHash                              << "\n"
@@ -356,6 +439,7 @@ static void applyCommand(const std::string &line, HeadlessState &state) {
             << "samples_read_per_sec="  << state.samplesReadPerSec                  << "\n"
             << "ring_fill="          << state.audioRing.available()                 << "\n"
             << "synth_input_buf="    << state.synthBufFill                          << "\n"
+            << "synth_clips_per_sec="<< state.synthClipsPerSec                      << "\n"
             << "backfire="           << (state.backfireEnabled.load() ? "on":"off") << "\n"
             << "underruns="          << state.underruns.load()                      << "\n"
             << std::flush;
@@ -363,7 +447,7 @@ static void applyCommand(const std::string &line, HeadlessState &state) {
 }
 
 // ---------------------------------------------------------------------------
-// stdin control thread
+// stdin / UDP threads
 // ---------------------------------------------------------------------------
 static void stdinThread(HeadlessState &state) {
     std::string line;
@@ -371,41 +455,29 @@ static void stdinThread(HeadlessState &state) {
         applyCommand(line, state);
 }
 
-// ---------------------------------------------------------------------------
-// UDP control thread (POSIX only)
-// ---------------------------------------------------------------------------
 #ifdef __unix__
 static void udpThread(HeadlessState &state, int port) {
     const int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
-        std::cerr << "[headless] UDP socket failed, UDP control disabled\n";
+        std::cerr << "[headless] UDP socket failed\n";
         return;
     }
-
     struct sockaddr_in addr{};
     addr.sin_family      = AF_INET;
     addr.sin_port        = htons(static_cast<uint16_t>(port));
     addr.sin_addr.s_addr = INADDR_ANY;
-
     if (bind(sock, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) < 0) {
         std::cerr << "[headless] UDP bind failed on port " << port << "\n";
         close(sock);
         return;
     }
-
-    struct timeval tv{};
-    tv.tv_sec  = 1;
-    tv.tv_usec = 0;
+    struct timeval tv{}; tv.tv_sec = 1;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    std::cerr << "[headless] UDP control listening on port " << port << "\n";
-
+    std::cerr << "[headless] UDP control on port " << port << "\n";
     char buf[256];
     while (state.running.load()) {
         const ssize_t n = recv(sock, buf, sizeof(buf) - 1, 0);
-        if (n > 0) {
-            buf[n] = '\0';
-            applyCommand(std::string(buf), state);
-        }
+        if (n > 0) { buf[n] = '\0'; applyCommand(std::string(buf), state); }
     }
     close(sock);
 }
@@ -414,27 +486,22 @@ static void udpThread(HeadlessState &, int) {}
 #endif
 
 // ---------------------------------------------------------------------------
-// Load WAV impulse response via miniaudio decoder
+// Load impulse response
 // ---------------------------------------------------------------------------
 static void loadImpulseResponse(
         Simulator *sim, int index, const std::string &path, float volume)
 {
     if (path.empty()) return;
-
     ma_decoder_config cfg = ma_decoder_config_init(ma_format_s16, 1, 44100);
     ma_uint64 frameCount  = 0;
     void     *pData       = nullptr;
-
     if (ma_decode_file(path.c_str(), &cfg, &frameCount, &pData) != MA_SUCCESS) {
-        std::cerr << "[headless] WARNING: cannot load impulse response: " << path << "\n";
+        std::cerr << "[headless] WARNING: cannot load IR: " << path << "\n";
         return;
     }
-
     sim->synthesizer().initializeImpulseResponse(
         static_cast<const int16_t *>(pData),
-        static_cast<unsigned int>(frameCount),
-        volume, index);
-
+        static_cast<unsigned int>(frameCount), volume, index);
     ma_free(pData, nullptr);
 }
 
@@ -447,7 +514,6 @@ static std::string argValue(int argc, char **argv,
         if (std::string(argv[i]) == flag) return argv[i + 1];
     return def;
 }
-
 static bool argFlag(int argc, char **argv, const char *flag) {
     for (int i = 1; i < argc; ++i)
         if (std::string(argv[i]) == flag) return true;
@@ -463,6 +529,10 @@ int main(int argc, char **argv) {
     const double      initThrottle = std::stod(argValue(argc, argv, "--throttle",    "0.5"));
     const bool        benchmark    = argFlag(argc, argv, "--benchmark");
     const int         sampleRate   = std::stoi(argValue(argc, argv, "--sample-rate", "44100"));
+    const int         periodFrames = std::stoi(argValue(argc, argv, "--period",      "512"));
+    const std::string wavPath      = argValue(argc, argv, "--write-wav",    "");
+    const int         wavSeconds   = std::stoi(argValue(argc, argv, "--wav-seconds", "30"));
+    const bool        noDevice     = argFlag(argc, argv, "--no-audio-device");
 
     std::srand(static_cast<unsigned>(std::time(nullptr)));
 
@@ -474,9 +544,6 @@ int main(int argc, char **argv) {
     Transmission *transmission = nullptr;
 
 #ifdef ATG_ENGINE_SIM_PIRANHA_ENABLED
-    // Generate a temporary wrapper if the script is not already a main.mr.
-    // Engine scripts define `public node main` but never call it; the wrapper
-    // imports the file and calls main() -- mirrors what assets/main.mr does.
     std::string compileTarget = scriptPath;
     std::string wrapperPath;
 
@@ -484,7 +551,6 @@ int main(int argc, char **argv) {
         return s.size() >= sfx.size() &&
                s.compare(s.size() - sfx.size(), sfx.size(), sfx) == 0;
     };
-
     if (!hasSuffix(scriptPath, "main.mr")) {
         const auto sep = scriptPath.find_last_of("/\\");
         const std::string dir  = (sep == std::string::npos) ? "." : scriptPath.substr(0, sep);
@@ -492,11 +558,10 @@ int main(int argc, char **argv) {
                                                              : scriptPath.substr(sep + 1);
         wrapperPath   = dir + "/__headless_main.mr";
         compileTarget = wrapperPath;
-
         std::ofstream wf(wrapperPath);
-        wf << "import \"engine_sim.mr\"\n";
-        wf << "import \"" << base << "\"\n";
-        wf << "main()\n";
+        wf << "import \"engine_sim.mr\"\n"
+           << "import \"" << base << "\"\n"
+           << "main()\n";
         wf.close();
     }
 
@@ -521,38 +586,29 @@ int main(int argc, char **argv) {
     return 1;
 #endif
 
-    if (!engine) {
-        std::cerr << "[headless] ERROR: script produced no engine\n";
-        return 1;
-    }
+    if (!engine) { std::cerr << "[headless] ERROR: no engine\n"; return 1; }
 
-    // Fallback vehicle
     if (!vehicle) {
         Vehicle::Parameters vp;
-        vp.mass              = units::mass(1597, units::kg);
-        vp.diffRatio         = 3.42;
-        vp.tireRadius        = units::distance(10, units::inch);
-        vp.dragCoefficient   = 0.25;
-        vp.crossSectionArea  =
+        vp.mass = units::mass(1597, units::kg);
+        vp.diffRatio = 3.42;
+        vp.tireRadius = units::distance(10, units::inch);
+        vp.dragCoefficient = 0.25;
+        vp.crossSectionArea =
             units::distance(6.0, units::foot) * units::distance(6.0, units::foot);
         vp.rollingResistance = 2000.0;
-        vehicle = new Vehicle;
-        vehicle->initialize(vp);
+        vehicle = new Vehicle; vehicle->initialize(vp);
     }
-
-    // Fallback transmission
     if (!transmission) {
         static const double gearRatios[] = { 2.97, 2.07, 1.43, 1.00, 0.84, 0.56 };
         Transmission::Parameters tp;
-        tp.GearCount       = 6;
-        tp.GearRatios      = gearRatios;
+        tp.GearCount = 6; tp.GearRatios = gearRatios;
         tp.MaxClutchTorque = units::torque(1000.0, units::ft_lb);
-        transmission = new Transmission;
-        transmission->initialize(tp);
+        transmission = new Transmission; transmission->initialize(tp);
     }
 
     // -----------------------------------------------------------------------
-    // 2. Create and configure simulator
+    // 2. Configure simulator
     // -----------------------------------------------------------------------
     Simulator *sim = engine->createSimulator(vehicle, transmission);
     engine->calculateDisplacement();
@@ -571,13 +627,10 @@ int main(int argc, char **argv) {
                                 static_cast<float>(ir->getVolume()));
     }
 
-    // -----------------------------------------------------------------------
-    // 3. Start synthesizer rendering thread
-    // -----------------------------------------------------------------------
     sim->startAudioRenderingThread();
 
     // -----------------------------------------------------------------------
-    // 4. Open audio device
+    // 3. Open audio device (optional)
     // -----------------------------------------------------------------------
     HeadlessState state;
     state.sim        = sim;
@@ -585,25 +638,63 @@ int main(int argc, char **argv) {
     state.sampleRate = sampleRate;
     state.throttle.store(initThrottle);
 
-    ma_device_config maCfg   = ma_device_config_init(ma_device_type_playback);
-    maCfg.playback.format    = ma_format_s16;
-    maCfg.playback.channels  = 1;
-    maCfg.sampleRate         = static_cast<ma_uint32>(sampleRate);
-    maCfg.dataCallback       = audioCallback;
-    maCfg.pUserData          = &state;
-    maCfg.periodSizeInFrames = 512; // ~11 ms at 44100 Hz
-
     ma_device maDevice;
-    if (ma_device_init(nullptr, &maCfg, &maDevice) != MA_SUCCESS) {
-        std::cerr << "[headless] ERROR: failed to open audio device\n";
-        sim->endAudioRenderingThread();
-        return 1;
+    bool deviceOpen = false;
+
+    if (!noDevice) {
+        ma_device_config maCfg   = ma_device_config_init(ma_device_type_playback);
+        maCfg.playback.format    = ma_format_s16;
+        maCfg.playback.channels  = 1;
+        maCfg.sampleRate         = static_cast<ma_uint32>(sampleRate);
+        maCfg.dataCallback       = audioCallback;
+        maCfg.pUserData          = &state;
+        maCfg.periodSizeInFrames = static_cast<ma_uint32>(periodFrames);
+
+        if (ma_device_init(nullptr, &maCfg, &maDevice) != MA_SUCCESS) {
+            std::cerr << "[headless] ERROR: failed to open audio device\n";
+            sim->endAudioRenderingThread();
+            return 1;
+        }
+        if (ma_device_start(&maDevice) != MA_SUCCESS) {
+            std::cerr << "[headless] ERROR: failed to start audio device\n";
+            ma_device_uninit(&maDevice);
+            sim->endAudioRenderingThread();
+            return 1;
+        }
+        deviceOpen = true;
+
+        // Print device info for diagnostics
+        const char *backendName = ma_get_backend_name(maDevice.pContext->backend);
+        const char *fmtName     = ma_get_format_name(maDevice.playback.format);
+        std::fprintf(stderr,
+            "[DEVICE] backend=%s name=\"%s\" rate=%u ch=%u fmt=%s"
+            " period=%u periods=%u\n",
+            backendName,
+            maDevice.playback.name,
+            maDevice.sampleRate,
+            maDevice.playback.channels,
+            fmtName,
+            maDevice.playback.internalPeriodSizeInFrames,
+            maDevice.playback.internalPeriods);
+    } else {
+        std::cerr << "[headless] No audio device (WAV-only mode)\n";
     }
-    if (ma_device_start(&maDevice) != MA_SUCCESS) {
-        std::cerr << "[headless] ERROR: failed to start audio device\n";
-        ma_device_uninit(&maDevice);
-        sim->endAudioRenderingThread();
-        return 1;
+
+    // -----------------------------------------------------------------------
+    // 4. Open WAV file if requested
+    // -----------------------------------------------------------------------
+    WavWriter wavWriter;
+    const uint32_t wavSamplesTarget =
+        static_cast<uint32_t>(wavSeconds) * static_cast<uint32_t>(sampleRate);
+    bool wavDone = false;
+
+    if (!wavPath.empty()) {
+        if (!wavWriter.open(wavPath.c_str(), sampleRate)) {
+            std::cerr << "[headless] ERROR: cannot open WAV: " << wavPath << "\n";
+        } else {
+            std::fprintf(stderr, "[WAV] Recording %d s to %s\n",
+                         wavSeconds, wavPath.c_str());
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -615,13 +706,13 @@ int main(int argc, char **argv) {
         std::cerr << "[headless] Autostart: ignition ON, starter ON (2 s)\n";
     }
 
-    std::cerr << "[headless] Engine:  " << engine->getName() << "\n";
-    std::cerr << "[headless] Audio:   " << sampleRate << " Hz, period=512 frames\n";
-    std::cerr << "[headless] Control: stdin or UDP port " << udpPort << "\n";
-    std::cerr << "[headless] Mode:    throttle (default)\n";
+    std::fprintf(stderr,
+        "[headless] Engine: %s | audio: %d Hz period=%d | %s\n",
+        engine->getName().c_str(), sampleRate, periodFrames,
+        noDevice ? "no-device (WAV only)" : "device open");
     std::cerr << "[headless] Commands: throttle|pedal|brake|speed|setrpm"
-                 " mode[throttle|rpm|hybrid] ignition|starter|gear|vgear"
-                 " autostart backfire audio_debug status quit\n";
+                 " mode ignition|starter|gear|vgear autostart"
+                 " tone backfire audio_debug status quit\n";
 
     // -----------------------------------------------------------------------
     // 6. Control threads
@@ -650,12 +741,13 @@ int main(int argc, char **argv) {
 
     bool starterReleased = !state.autostart.load();
 
-    // Virtual gear auto-shift state (Hybrid mode only, main-thread)
     int    vGear        = 1;
     double shiftDropRem = 0.0;
     double shiftDropAmt = 0.0;
 
-    // Audio diagnostic accumulators (main-thread only)
+    // Tone generator phase (main-thread only)
+    double tonePhase = 0.0;
+
     auto     audioSnapEpoch  = loopStart;
     int      epochGenSamples = 0;
     float    epochPeak       = 0.0f;
@@ -663,6 +755,7 @@ int main(int argc, char **argv) {
     int      epochZeroCross  = 0;
     uint32_t epochHash       = 0;
     int16_t  diagPrevSample  = 0;
+    int      epochSynthClips = 0;
 
     engine->setSpeedControl(initThrottle);
 
@@ -673,39 +766,31 @@ int main(int argc, char **argv) {
         prevFrame = frameStart;
 
         // ------------------------------------------------------------------
-        // Dispatch pending one-shot commands (main thread owns engine objects)
+        // Pending one-shot commands
         // ------------------------------------------------------------------
         {
             const int pi = state.pendingIgnition.exchange(-1, std::memory_order_relaxed);
             if (pi != -1) engine->getIgnitionModule()->m_enabled = (pi == 1);
-
             const int ps = state.pendingStarter.exchange(-1, std::memory_order_relaxed);
             if (ps != -1) sim->m_starterMotor.m_enabled = (ps == 1);
-
             const int pg = state.pendingGear.exchange(-2, std::memory_order_relaxed);
             if (pg != -2) sim->getTransmission()->changeGear(pg);
         }
 
         // ------------------------------------------------------------------
-        // Autostart timer: release starter + select gear 1 after 2 s
+        // Autostart timer
         // ------------------------------------------------------------------
         if (!starterReleased) {
             if (Seconds(frameStart - loopStart).count() >= 2.0) {
                 sim->m_starterMotor.m_enabled = false;
-                sim->getTransmission()->changeGear(0); // gear 1 (0-indexed API)
+                sim->getTransmission()->changeGear(0);
                 starterReleased = true;
-                std::cerr << "[headless] Autostart: starter OFF, gear 1 selected\n";
+                std::cerr << "[headless] Autostart: starter OFF, gear 1\n";
             }
         }
 
         // ------------------------------------------------------------------
-        // Compute setSpeedControl value from active control mode.
-        //
-        // DirectThrottleLinkage convention: setSpeedControl(s)
-        //   s=0 -> throttle_position=1 -> full throttle
-        //   s=1 -> throttle_position=0 -> idle
-        //
-        // No crankshaft.v_theta forcing in any mode.
+        // Control mode -> setSpeedControl (no v_theta forcing)
         // ------------------------------------------------------------------
         const ControlMode mode  = static_cast<ControlMode>(
                                       state.mode.load(std::memory_order_relaxed));
@@ -718,38 +803,29 @@ int main(int argc, char **argv) {
 
         double sc;
         switch (mode) {
-
         case ControlMode::Rpm: {
             const double tRpm = state.targetRpm.load(std::memory_order_relaxed);
             sc = (rpmSpan > 0.0)
-                ? std::max(0.0, std::min(1.0, 1.0 - (tRpm - idleRpm) / rpmSpan))
-                : 0.5;
+                ? std::max(0.0, std::min(1.0, 1.0 - (tRpm - idleRpm) / rpmSpan)) : 0.5;
             break;
         }
-
         case ControlMode::Hybrid: {
-            // Virtual gear auto-shift
             const int manualGear = state.vGearManual.load(std::memory_order_relaxed);
             if (manualGear >= 1 && manualGear <= 5) {
                 vGear = manualGear;
             } else {
-                const double upshiftBonus = (pedal > 75.0) ?  8.0
-                                          : (pedal < 30.0) ? -3.0 : 0.0;
-                const double upshiftMph   = kVGears[vGear - 1].maxMph
-                                            + kUpshiftOffsetMph[vGear - 1]
-                                            + upshiftBonus;
+                const double upshiftBonus = (pedal > 75.0) ? 8.0 : (pedal < 30.0) ? -3.0 : 0.0;
+                const double upshiftMph   = kVGears[vGear-1].maxMph
+                                            + kUpshiftOffsetMph[vGear-1] + upshiftBonus;
                 if (vGear < 5 && speedMph > upshiftMph) {
                     ++vGear;
                     shiftDropAmt = 800.0 + static_cast<double>(std::rand() % 401);
                     shiftDropRem = 0.150 + static_cast<double>(std::rand() % 101) * 0.001;
-                } else if (vGear > 1 && speedMph < kVGears[vGear - 1].minMph - 2.0) {
-                    --vGear;
-                    shiftDropRem = 0.0;
+                } else if (vGear > 1 && speedMph < kVGears[vGear-1].minMph - 2.0) {
+                    --vGear; shiftDropRem = 0.0;
                 }
             }
             state.vGearCurrent.store(vGear, std::memory_order_relaxed);
-
-            // Target RPM from gear table + optional shift dip
             double tRpm = vGearRpm(vGear, speedMph);
             if (shiftDropRem > 0.0) {
                 const double frac = shiftDropRem / 0.200;
@@ -759,22 +835,17 @@ int main(int argc, char **argv) {
             }
             tRpm = std::max(idleRpm, std::min(maxRpm, tRpm));
             state.targetRpm.store(tRpm, std::memory_order_relaxed);
-
-            // Map to setSpeedControl; pedal can push toward more throttle
             const double s_speed = (rpmSpan > 0.0)
-                ? std::max(0.0, std::min(1.0, 1.0 - (tRpm - idleRpm) / rpmSpan))
-                : 0.5;
+                ? std::max(0.0, std::min(1.0, 1.0 - (tRpm - idleRpm) / rpmSpan)) : 0.5;
             const double s_pedal = std::max(0.0, std::min(1.0, 1.0 - pedal / 100.0));
             sc = std::min(s_speed, s_pedal);
             sc = std::min(1.0, sc + brake * 0.5);
             break;
         }
-
-        default: // ControlMode::Throttle
+        default:
             sc = state.throttle.load(std::memory_order_relaxed);
             break;
         }
-
         engine->setSpeedControl(sc);
 
         // ------------------------------------------------------------------
@@ -786,30 +857,95 @@ int main(int argc, char **argv) {
         stepCount += sim->getFrameIterationCount();
 
         // ------------------------------------------------------------------
-        // Drain synthesizer output into the SPSC ring.
-        // Mirrors GUI: main thread drains synthesizer; callback reads ring.
+        // Audio: either engine synthesis or tone generator
         // ------------------------------------------------------------------
-        {
+        if (state.toneActive.load(std::memory_order_relaxed)) {
+            // Tone mode: generate sine wave directly to ring and/or WAV.
+            // Keep ring at ~50% capacity; let synth buffer stay full (it pauses).
+            const int target  = AudioRing::kSize / 2;
+            const int ringFill = state.audioRing.available();
+            int toGen = target - ringFill;
+            if (toGen <= 0) toGen = 0;
+            // Also generate for WAV even if ring is full
+            const int toGenWav = (!wavDone && wavWriter.isOpen())
+                ? static_cast<int>(wallDt * sampleRate) + 64 : 0;
+            const int total = std::max(toGen, toGenWav);
+
+            if (total > 0) {
+                static int16_t toneBuf[AudioRing::kSize];
+                const int n = total < AudioRing::kSize ? total : AudioRing::kSize - 1;
+                const double freq     = state.toneFreq.load(std::memory_order_relaxed);
+                const double phaseInc = 2.0 * M_PI * freq / sampleRate;
+                for (int i = 0; i < n; ++i) {
+                    toneBuf[i] = static_cast<int16_t>(
+                        std::sin(tonePhase) * 0.707 * 32767.0);
+                    tonePhase += phaseInc;
+                    if (tonePhase > 2.0 * M_PI) tonePhase -= 2.0 * M_PI;
+                }
+                if (!noDevice && toGen > 0)
+                    state.audioRing.write(toneBuf, toGen < n ? toGen : n);
+                // Write to WAV
+                if (!wavDone && wavWriter.isOpen()) {
+                    const uint32_t remaining = wavSamplesTarget - wavWriter.samplesWritten;
+                    const int toWav = static_cast<int>(remaining) < n
+                                      ? static_cast<int>(remaining) : n;
+                    if (toWav > 0) wavWriter.write(toneBuf, toWav);
+                    if (wavWriter.samplesWritten >= wavSamplesTarget) {
+                        wavWriter.close();
+                        wavDone = true;
+                        std::fprintf(stderr, "[WAV] Done: %d s (%u samples) -- tone\n",
+                                     wavSeconds, wavSamplesTarget);
+                        if (noDevice) state.running.store(false, std::memory_order_relaxed);
+                    }
+                }
+                epochGenSamples += n;
+            }
+        } else {
+            // Normal engine synthesis drain
             static int16_t drainBuf[2048];
             int drained;
             do {
                 drained = sim->readAudioOutput(2048, drainBuf);
                 if (drained > 0) {
-                    state.audioRing.write(drainBuf, drained);
+                    // Write to WAV
+                    if (!wavDone && wavWriter.isOpen()) {
+                        const uint32_t remaining = wavSamplesTarget - wavWriter.samplesWritten;
+                        const int toWav = static_cast<int>(remaining) < drained
+                                          ? static_cast<int>(remaining) : drained;
+                        if (toWav > 0) wavWriter.write(drainBuf, toWav);
+                        if (wavWriter.samplesWritten >= wavSamplesTarget) {
+                            wavWriter.close();
+                            wavDone = true;
+                            std::fprintf(stderr,
+                                "[WAV] Done: %d s (%u samples) -- engine audio\n",
+                                wavSeconds, wavSamplesTarget);
+                            if (noDevice)
+                                state.running.store(false, std::memory_order_relaxed);
+                        }
+                    }
+                    // Write to ring (only if device is open)
+                    if (!noDevice)
+                        state.audioRing.write(drainBuf, drained);
 
+                    // Diagnostics
                     epochGenSamples += drained;
                     for (int i = 0; i < drained; ++i) {
-                        const float v  = drainBuf[i] * (1.0f / 32767.0f);
-                        const float av = v < 0.0f ? -v : v;
+                        const int16_t s = drainBuf[i];
+                        const float   v  = s * (1.0f / 32767.0f);
+                        const float   av = v < 0.0f ? -v : v;
                         if (av > epochPeak) epochPeak = av;
                         epochSumSq += v * v;
-                        if ((drainBuf[i] >= 0) != (diagPrevSample >= 0)) ++epochZeroCross;
-                        diagPrevSample = drainBuf[i];
+                        if ((s >= 0) != (diagPrevSample >= 0)) ++epochZeroCross;
+                        diagPrevSample = s;
                         epochHash = (epochHash << 5u) ^ (epochHash >> 27u)
-                                    ^ static_cast<uint32_t>(static_cast<uint16_t>(drainBuf[i]));
+                                    ^ static_cast<uint32_t>(static_cast<uint16_t>(s));
+                        // Count samples at INT16 ceiling/floor (synthesizer saturation)
+                        if (s >= 32767 || s <= -32767) ++epochSynthClips;
                     }
                 }
-            } while (drained == 2048);
+            } while (drained == 2048 && !state.running.load() == false);
+            // Note: "while drained == 2048" keeps draining; the extra check prevents
+            // spinning after quit is set (not strictly necessary but defensive).
         }
 
         // ------------------------------------------------------------------
@@ -831,13 +967,14 @@ int main(int argc, char **argv) {
                 state.samplesReadPerSec = static_cast<int>(cbRead / snapElapsed);
                 state.synthBufFill      = static_cast<int>(
                     sim->getSynthesizerInputLatency() * static_cast<double>(sampleRate));
+                state.synthClipsPerSec  = epochSynthClips;
 
                 if (state.audioDebug.load(std::memory_order_relaxed)) {
                     std::fprintf(stderr,
-                        "[AUDIO] rpm=%.0f throttle=%.3f"
+                        "[AUDIO] rpm=%.0f sc=%.3f"
                         " rms=%.4f peak=%.4f leveler=%.5f"
                         " gen/s=%d read/s=%d ring=%d zcr=%.0f"
-                        " hash=%08X underruns=%d\n",
+                        " hash=%08X clips/s=%d underruns=%d%s\n",
                         engine->getRpm(),
                         engine->getThrottle(),
                         state.snapshotRms,
@@ -848,7 +985,9 @@ int main(int argc, char **argv) {
                         state.audioRing.available(),
                         static_cast<double>(state.zeroCrossRate),
                         state.audioHash,
-                        state.underruns.load());
+                        state.synthClipsPerSec,
+                        state.underruns.load(),
+                        state.toneActive.load() ? " [TONE]" : "");
                 }
 
                 epochGenSamples = 0;
@@ -856,6 +995,7 @@ int main(int argc, char **argv) {
                 epochSumSq      = 0.0f;
                 epochZeroCross  = 0;
                 epochHash       = 0;
+                epochSynthClips = 0;
                 audioSnapEpoch  = now;
             }
         }
@@ -870,24 +1010,17 @@ int main(int argc, char **argv) {
                 const double simFreq = static_cast<double>(sim->getSimulationFrequency());
                 const double rtf     = (benchElapsed > 0.0)
                     ? (stepCount / simFreq) / benchElapsed : 0.0;
-
                 const double cpuNow  = processCpuSeconds();
                 const double cpuPct  = (benchElapsed > 0.0)
                     ? (cpuNow - cpuPrev) / benchElapsed * 100.0 : 0.0;
                 cpuPrev = cpuNow;
-
-                const int undrNow   = state.underruns.load();
-                const int undrEpoch = undrNow - underrunsPrev;
-                underrunsPrev = undrNow;
-
+                const int undrEpoch = state.underruns.load() - underrunsPrev;
+                underrunsPrev = state.underruns.load();
                 std::fprintf(stderr,
                     "[BENCH] rtf=%.3f underruns=%d ring=%d cpu=%.1f%% steps/s=%lld\n",
-                    rtf, undrEpoch,
-                    state.audioRing.available(),
-                    cpuPct,
+                    rtf, undrEpoch, state.audioRing.available(), cpuPct,
                     static_cast<long long>(benchElapsed > 0.0
                         ? stepCount / benchElapsed : 0));
-
                 benchEpoch = now;
                 stepCount  = 0;
             }
@@ -905,12 +1038,21 @@ int main(int argc, char **argv) {
     // -----------------------------------------------------------------------
     std::cerr << "[headless] Shutting down...\n";
 
-    ma_device_stop(&maDevice);
-    ma_device_uninit(&maDevice);
+    if (deviceOpen) {
+        ma_device_stop(&maDevice);
+        ma_device_uninit(&maDevice);
+    }
+
+    // Finalize WAV if still open (e.g. quit before wavSeconds elapsed)
+    if (wavWriter.isOpen()) {
+        std::fprintf(stderr, "[WAV] Finalizing %u samples (%.1f s)\n",
+                     wavWriter.samplesWritten,
+                     static_cast<double>(wavWriter.samplesWritten) / sampleRate);
+        wavWriter.close();
+    }
 
     sim->endAudioRenderingThread();
-
-    stdinThr.detach(); // may be blocked on getline
+    stdinThr.detach();
     udpThr.join();
 
     sim->releaseSimulation();
