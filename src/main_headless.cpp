@@ -1,4 +1,4 @@
-// engine-sim headless entry point
+﻿// engine-sim headless entry point
 // Targets ARM64 Linux (Raspberry Pi 4) / EV-Tesla sound project.
 // Windows MSVC is the build-test platform; Pi 4 ARM64 Linux is production.
 //
@@ -80,7 +80,7 @@ struct BackfireCfg {
     std::atomic<int>   trigSamples   { 0    };
 };
 
-// Audio-callback-exclusive state — no atomics needed, only one thread touches it.
+// Audio-callback-exclusive state -- no atomics needed, only one thread touches it.
 struct BackfireCbState {
     int      active   = 0;           // remaining samples in current pop
     int      total    = 0;
@@ -101,7 +101,7 @@ struct HeadlessState {
     std::atomic<bool>   running    { true };
 
     // --- throttle mode ---
-    // DirectThrottleLinkage convention: s=0 → full throttle, s=1 → idle.
+    // DirectThrottleLinkage convention: s=0 -> full throttle, s=1 -> idle.
     std::atomic<double> throttle   { 0.5 };
 
     // --- extended EV/CAN inputs ---
@@ -121,6 +121,16 @@ struct HeadlessState {
     BackfireCfg     backfire;
     BackfireCbState backfireCb;         // audio callback exclusive
     std::atomic<int> backfireEpochCount { 0 }; // reset each benchmark interval
+
+    // --- startup / gear ---
+    std::atomic<bool> autostart      { true };  // perform ignition+starter on launch
+
+    // Pending one-shot commands dispatched to main thread each frame.
+    // Sentinel -1 = no change pending; avoids touching engine objects from
+    // command threads while physics may be running on the main thread.
+    std::atomic<int>  pendingIgnition { -1 }; // 0=off, 1=on
+    std::atomic<int>  pendingStarter  { -1 }; // 0=off, 1=on
+    std::atomic<int>  pendingGear     { -2 }; // -1=neutral, 0..N=gear (0-indexed); -2=none
 };
 
 // ---------------------------------------------------------------------------
@@ -139,7 +149,7 @@ static void triggerBackfire(HeadlessState &state) {
 }
 
 // ---------------------------------------------------------------------------
-// miniaudio callback — pulls engine audio then mixes synthetic backfire pop
+// miniaudio callback -- pulls engine audio then mixes synthetic backfire pop
 // ---------------------------------------------------------------------------
 static void audioCallback(
         ma_device *device, void *output, const void *, ma_uint32 frameCount)
@@ -176,7 +186,7 @@ static void audioCallback(
                                     ? static_cast<ma_uint32>(cb.active)
                                     : frameCount;
         for (ma_uint32 i = 0; i < toPlay; ++i) {
-            // xorshift32 white noise — no heap, no branches
+            // xorshift32 white noise -- no heap, no branches
             cb.rng ^= cb.rng << 13u;
             cb.rng ^= cb.rng >> 17u;
             cb.rng ^= cb.rng <<  5u;
@@ -196,7 +206,7 @@ static void audioCallback(
 }
 
 // ---------------------------------------------------------------------------
-// Command parser — shared by stdin and UDP threads
+// Command parser -- shared by stdin and UDP threads
 // ---------------------------------------------------------------------------
 static void applyCommand(const std::string &line, HeadlessState &state) {
     std::istringstream ss(line);
@@ -285,6 +295,29 @@ static void applyCommand(const std::string &line, HeadlessState &state) {
             std::cout << "[backfire] test pop fired\n" << std::flush;
         }
 
+    } else if (cmd == "ignition") {
+        std::string sub;
+        if (ss >> sub)
+            state.pendingIgnition.store(sub == "on" ? 1 : 0, std::memory_order_relaxed);
+
+    } else if (cmd == "starter") {
+        std::string sub;
+        if (ss >> sub)
+            state.pendingStarter.store(sub == "on" ? 1 : 0, std::memory_order_relaxed);
+
+    } else if (cmd == "gear") {
+        int n = 1;
+        if (ss >> n) {
+            // User-visible: 0=neutral, 1=1st, 2=2nd... -> API: -1=neutral, 0=1st...
+            const int apiGear = (n <= 0) ? -1 : n - 1;
+            state.pendingGear.store(apiGear, std::memory_order_relaxed);
+        }
+
+    } else if (cmd == "autostart") {
+        std::string sub;
+        if (ss >> sub)
+            state.autostart.store(sub == "on", std::memory_order_relaxed);
+
     } else if (cmd == "quit") {
         state.running.store(false, std::memory_order_relaxed);
 
@@ -295,23 +328,35 @@ static void applyCommand(const std::string &line, HeadlessState &state) {
             case ControlMode::Hybrid: modeStr = "hybrid"; break;
             default: break;
         }
-        const double rpm = state.engine ? state.engine->getRpm() : 0.0;
+        const double rpm      = state.engine ? state.engine->getRpm() : 0.0;
+        const bool   ignition = state.engine
+            ? state.engine->getIgnitionModule()->m_enabled : false;
+        const bool   starter  = state.sim
+            ? state.sim->m_starterMotor.m_enabled : false;
+        const int    gearApi  = state.sim
+            ? state.sim->getTransmission()->getGear() : -1;
+        const std::string gearStr = (gearApi == -1)
+            ? "N" : std::to_string(gearApi + 1);
+
         std::cout
-            << "mode="           << modeStr                                  << "\n"
-            << "throttle="       << state.throttle.load()                    << "\n"
-            << "pedal="          << state.pedal.load()                       << "\n"
-            << "brake="          << state.brake.load()                       << "\n"
-            << "speed_mph="      << state.speedMph.load()                    << "\n"
-            << "rpm="            << rpm                                       << "\n"
-            << "target_rpm="     << state.targetRpm.load()                   << "\n"
-            << "idle_rpm="       << state.idleRpm.load()                     << "\n"
-            << "rpm_per_mph="    << state.rpmPerMph.load()                   << "\n"
-            << "max_rpm="        << state.maxRpm.load()                      << "\n"
-            << "backfire="       << (state.backfire.enabled.load()?"on":"off")<< "\n"
-            << "backfire_chance="<< state.backfire.chance.load()             << "\n"
-            << "backfire_volume="<< state.backfire.volume.load()             << "\n"
-            << "backfire_count=" << state.backfire.count.load()              << "\n"
-            << "underruns="      << state.underruns.load()                   << "\n"
+            << "mode="           << modeStr                                   << "\n"
+            << "ignition="       << (ignition ? "on" : "off")                 << "\n"
+            << "starter="        << (starter  ? "on" : "off")                 << "\n"
+            << "gear="           << gearStr                                    << "\n"
+            << "throttle="       << state.throttle.load()                     << "\n"
+            << "pedal="          << state.pedal.load()                        << "\n"
+            << "brake="          << state.brake.load()                        << "\n"
+            << "speed_mph="      << state.speedMph.load()                     << "\n"
+            << "rpm="            << rpm                                        << "\n"
+            << "target_rpm="     << state.targetRpm.load()                    << "\n"
+            << "idle_rpm="       << state.idleRpm.load()                      << "\n"
+            << "rpm_per_mph="    << state.rpmPerMph.load()                    << "\n"
+            << "max_rpm="        << state.maxRpm.load()                       << "\n"
+            << "backfire="       << (state.backfire.enabled.load()?"on":"off") << "\n"
+            << "backfire_chance="<< state.backfire.chance.load()              << "\n"
+            << "backfire_volume="<< state.backfire.volume.load()              << "\n"
+            << "backfire_count=" << state.backfire.count.load()               << "\n"
+            << "underruns="      << state.underruns.load()                    << "\n"
             << std::flush;
     }
 }
@@ -430,7 +475,7 @@ int main(int argc, char **argv) {
 #ifdef ATG_ENGINE_SIM_PIRANHA_ENABLED
     // Engine scripts define `public node main` but never instantiate it.
     // Generate a temporary wrapper (placed beside the script) that imports
-    // the engine file and calls main() — mirrors what assets/main.mr does.
+    // the engine file and calls main() -- mirrors what assets/main.mr does.
     std::string compileTarget = scriptPath;
     std::string wrapperPath;
 
@@ -558,11 +603,24 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // -----------------------------------------------------------------------
+    // Default operating profile for EV use case
+    // -----------------------------------------------------------------------
+    state.mode.store((int)ControlMode::Hybrid, std::memory_order_relaxed);
+
+    if (state.autostart.load()) {
+        // Ignition ON immediately
+        engine->getIgnitionModule()->m_enabled = true;
+        // Starter ON -- held for 2 s then released in the main loop
+        sim->m_starterMotor.m_enabled = true;
+        std::cerr << "[headless] Autostart: ignition ON, starter ON (2 s)\n";
+    }
+
     std::cerr << "[headless] Engine: "  << engine->getName() << "\n";
     std::cerr << "[headless] Audio: "   << sampleRate << " Hz, period=512 frames\n";
     std::cerr << "[headless] Control: stdin or UDP port " << udpPort << "\n";
     std::cerr << "[headless] Commands: throttle|pedal|brake|speed|setrpm|torque"
-                 " mode[throttle|rpm|hybrid] status quit\n";
+                 " mode[throttle|rpm|hybrid] ignition|starter|gear|autostart status quit\n";
     std::cerr << "[headless] Backfire: backfire on|off|chance|volume|rpm_min|test\n";
 
     // -----------------------------------------------------------------------
@@ -590,9 +648,12 @@ int main(int argc, char **argv) {
     long long stepCount   = 0;
     int underrunsPrev     = 0;
 
-    // Backfire trigger state (main-thread only — no atomics needed)
+    // Backfire trigger state (main-thread only -- no atomics needed)
     double prevPedal  = 0.0;
     double bfCooldown = 0.0; // seconds until next backfire is eligible
+
+    // Autostart state: track whether the starter has been released yet
+    bool starterReleased = !state.autostart.load();
 
     engine->setSpeedControl(initThrottle);
 
@@ -603,11 +664,38 @@ int main(int argc, char **argv) {
         prevFrame = frameStart;
 
         // ------------------------------------------------------------------
+        // Dispatch pending one-shot commands (safe: main thread owns engine objects)
+        // ------------------------------------------------------------------
+        {
+            const int pi = state.pendingIgnition.exchange(-1, std::memory_order_relaxed);
+            if (pi != -1) engine->getIgnitionModule()->m_enabled = (pi == 1);
+
+            const int ps = state.pendingStarter.exchange(-1, std::memory_order_relaxed);
+            if (ps != -1) sim->m_starterMotor.m_enabled = (ps == 1);
+
+            const int pg = state.pendingGear.exchange(-2, std::memory_order_relaxed);
+            if (pg != -2) sim->getTransmission()->changeGear(pg);
+        }
+
+        // ------------------------------------------------------------------
+        // Autostart timer: release starter and select gear 1 after 2 s
+        // ------------------------------------------------------------------
+        if (!starterReleased) {
+            const double elapsed = Seconds(frameStart - loopStart).count();
+            if (elapsed >= 2.0) {
+                sim->m_starterMotor.m_enabled = false;
+                sim->getTransmission()->changeGear(0); // gear 1 (0-indexed)
+                starterReleased = true;
+                std::cerr << "[headless] Autostart: starter OFF, gear 1 selected\n";
+            }
+        }
+
+        // ------------------------------------------------------------------
         // Compute setSpeedControl value from active mode.
         //
         // DirectThrottleLinkage maps setSpeedControl(s) as:
-        //   s=0 → throttle_position=1 → full throttle
-        //   s=1 → throttle_position=0 → idle
+        //   s=0 -> throttle_position=1 -> full throttle
+        //   s=1 -> throttle_position=0 -> idle
         // So pedal 0-100 maps to s = 1 - pedal/100.
         // ------------------------------------------------------------------
         const ControlMode mode     = static_cast<ControlMode>(
@@ -643,7 +731,7 @@ int main(int argc, char **argv) {
                 sc = std::min(1.0, sc + brake * 0.5);
                 break;
             }
-            default: // ControlMode::Throttle — legacy direct pass-through
+            default: // ControlMode::Throttle -- legacy direct pass-through
                 sc = state.throttle.load(std::memory_order_relaxed);
                 break;
         }
