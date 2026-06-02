@@ -338,8 +338,12 @@ static void applyCommand(const std::string &line, HeadlessState &state) {
             // any target RPM within a few seconds.
             state.pendingGear.store(-1, std::memory_order_relaxed);
         }
-        else if (sub == "hybrid")
-            state.mode.store((int)ControlMode::Hybrid,   std::memory_order_relaxed);
+        else if (sub == "hybrid") {
+            state.mode.store((int)ControlMode::Hybrid, std::memory_order_relaxed);
+            // Neutral removes drivetrain resistance; hybrid uses direct RPM
+            // control so the transmission must not fight the crankshaft.
+            state.pendingGear.store(-1, std::memory_order_relaxed);
+        }
 
     } else if (cmd == "rpm_per_mph") {
         double v = 85.0;
@@ -735,6 +739,11 @@ int main(int argc, char **argv) {
     // Default operating profile for EV use case
     // -----------------------------------------------------------------------
     state.mode.store((int)ControlMode::Hybrid, std::memory_order_relaxed);
+    // Hybrid uses direct crankshaft RPM control; neutral removes drivetrain load.
+    // The autostart sequence selects gear 1 after 2 s, but we immediately
+    // override that once the gear-selection window passes -- so set neutral now
+    // and also schedule it again via pendingGear after the loop starts.
+    sim->getTransmission()->changeGear(-1);
 
     if (state.autostart.load()) {
         // Ignition ON immediately
@@ -832,9 +841,18 @@ int main(int argc, char **argv) {
             const double elapsed = Seconds(frameStart - loopStart).count();
             if (elapsed >= 2.0) {
                 sim->m_starterMotor.m_enabled = false;
-                sim->getTransmission()->changeGear(0); // gear 1 (0-indexed)
+                // In hybrid/rpm modes keep neutral so the drivetrain doesn't
+                // resist direct RPM control; throttle mode uses gear 1.
+                const ControlMode curMode = static_cast<ControlMode>(
+                    state.mode.load(std::memory_order_relaxed));
+                if (curMode == ControlMode::Throttle) {
+                    sim->getTransmission()->changeGear(0);
+                    std::cerr << "[headless] Autostart: starter OFF, gear 1 selected\n";
+                } else {
+                    sim->getTransmission()->changeGear(-1);
+                    std::cerr << "[headless] Autostart: starter OFF, gear neutral (hybrid/rpm mode)\n";
+                }
                 starterReleased = true;
-                std::cerr << "[headless] Autostart: starter OFF, gear 1 selected\n";
             }
         }
 
@@ -921,17 +939,19 @@ int main(int argc, char **argv) {
                 break;
             }
             case ControlMode::Hybrid: {
-                // Speed sets baseline RPM; pedal adds extra throttle on top.
-                const double speedRpm = std::max(idleRpm,
+                // EV sound mapping layer -- no drivetrain physics.
+                // Speed maps deterministically to crankshaft RPM (set below via
+                // v_theta, same path as rpm mode). Pedal controls throttle opening
+                // so combustion runs louder/harder at higher pedal. Brake reduces
+                // throttle for an engine-braking feel.
+                const double hybridRpm = std::max(idleRpm,
                     std::min(maxRpm, idleRpm + speedMph * rpmPerMph));
-                const double s_speed  = (rpmSpan > 0.0)
-                    ? std::max(0.0, std::min(1.0, 1.0 - (speedRpm - idleRpm) / rpmSpan))
-                    : 0.5;
-                const double s_pedal  = std::max(0.0, std::min(1.0, 1.0 - pedal / 100.0));
-                // Lower s = more throttle; take the more aggressive of the two.
-                sc = std::min(s_speed, s_pedal);
-                // Brake input increases s = engine braking / deceleration feel.
-                sc = std::min(1.0, sc + brake * 0.5);
+                // Store the computed target so status can display it.
+                state.targetRpm.store(hybridRpm, std::memory_order_relaxed);
+                // Throttle: pedal 0 = idle (s=1), pedal 100 = full open (s=0).
+                // Brake adds engine-braking by reducing throttle further.
+                const double s_pedal = std::max(0.0, std::min(1.0, 1.0 - pedal / 100.0));
+                sc = std::min(1.0, s_pedal + brake * 0.3);
                 break;
             }
             default: // ControlMode::Throttle -- legacy direct pass-through
@@ -951,12 +971,15 @@ int main(int argc, char **argv) {
         // frequency, producing genuinely synthesized audio at that RPM.
         // The PI controller still drives throttle for realistic combustion.
         // ------------------------------------------------------------------
-        if (mode == ControlMode::Rpm && engine->getCrankshaftCount() > 0) {
+        // Both rpm and hybrid modes directly enforce crankshaft angular velocity.
+        // targetRpm is already set (rpm mode: from setrpm; hybrid mode: updated
+        // inside the switch above from the speed mapping).
+        if ((mode == ControlMode::Rpm || mode == ControlMode::Hybrid)
+                && engine->getCrankshaftCount() > 0) {
             constexpr double kRpmToRad = 2.0 * 3.14159265358979323846 / 60.0;
             const double tRpm   = state.targetRpm.load(std::memory_order_relaxed);
             const double tOmega = std::max(0.0, tRpm) * kRpmToRad;
             Crankshaft   *cs    = engine->getCrankshaft(0);
-            // Preserve rotation direction; Honda TRX520 spins CW (negative v_theta)
             const double sign   = (cs->m_body.v_theta <= 0.0) ? -1.0 : 1.0;
             cs->m_body.v_theta  = sign * tOmega;
         }
