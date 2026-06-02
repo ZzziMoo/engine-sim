@@ -10,10 +10,14 @@
 //             [--no-audio-device]
 //
 // Diagnostic flags:
-//   --write-wav out.wav   capture synthesis output to a WAV file
-//   --wav-seconds 30      WAV duration (default 30 s), then exit
-//   --no-audio-device     render to WAV only, no speaker output
-//   --period 512|1024|2048  miniaudio period size (default 512)
+//   --write-wav out.wav      capture synthesis output to a WAV file (pre-ring)
+//   --write-live-wav out.wav capture hardware output to a WAV file (post-ring)
+//   --wav-seconds 30         WAV duration (default 30 s), then exit
+//   --no-audio-device        render to WAV only, no speaker output
+//   --period 512|1024|2048   miniaudio period size (default 512)
+//
+// Comparison test:
+//   If synth.wav is clean but live.wav crackles -> ring/callback path corrupting audio
 //
 // Commands:  tone <Hz>|off   -- replace engine audio with a pure sine wave
 
@@ -164,14 +168,16 @@ struct WavWriter {
 
 // ---------------------------------------------------------------------------
 // SPSC audio ring -- decouples 60 Hz synthesis from ~86 Hz audio callback.
+// Producer: main loop. Consumer: audio callback (and captureRing drain).
 // ---------------------------------------------------------------------------
 struct AudioRing {
     static constexpr int kSize = 16384;
     static constexpr int kMask = kSize - 1;
 
     int16_t data[kSize] {};
-    std::atomic<int> wIdx { 0 };
-    std::atomic<int> rIdx { 0 };
+    std::atomic<int> wIdx     { 0 };
+    std::atomic<int> rIdx     { 0 };
+    std::atomic<int> overruns { 0 }; // samples dropped due to ring full
 
     int available() const {
         return (wIdx.load(std::memory_order_acquire) -
@@ -179,9 +185,14 @@ struct AudioRing {
     }
     int freeSlots() const { return kSize - 1 - available(); }
 
+    // Returns how many samples were actually written (< n if ring was full).
+    // Counts truncated samples in overruns.
     int write(const int16_t *src, int n) {
         const int free = freeSlots();
-        if (n > free) n = free;
+        if (n > free) {
+            overruns.fetch_add(n - free, std::memory_order_relaxed);
+            n = free;
+        }
         const int w = wIdx.load(std::memory_order_relaxed);
         for (int i = 0; i < n; ++i)
             data[(w + i) & kMask] = src[i];
@@ -197,6 +208,10 @@ struct AudioRing {
             dst[i] = data[(r + i) & kMask];
         rIdx.store((r + n) & kMask, std::memory_order_release);
         return n;
+    }
+
+    int getAndClearOverruns() {
+        return overruns.exchange(0, std::memory_order_relaxed);
     }
 };
 
@@ -242,15 +257,20 @@ struct HeadlessState {
     AudioRing audioRing;
     std::atomic<int> cbSamplesRead { 0 };
 
-    // Diagnostic snapshots (written by main loop)
+    // Live WAV capture: callback writes here; main loop drains to WAV file.
+    AudioRing         captureRing;
+    std::atomic<bool> captureActive { false };
+
+    // Diagnostic snapshots (written by main loop, read by status/audio_debug)
     float    snapshotRms        = 0.0f;
     float    snapshotPeak       = 0.0f;
     int      synthBufFill       = 0;
-    int      samplesGenPerSec   = 0;
-    int      samplesReadPerSec  = 0;
+    int      samplesGenPerSec   = 0;   // samples drained from synth
+    int      samplesReadPerSec  = 0;   // samples consumed by callback
     uint32_t audioHash          = 0;
     float    zeroCrossRate      = 0.0f;
-    int      synthClipsPerSec   = 0; // synth output samples at INT16 ceiling/floor
+    int      synthClipsPerSec   = 0;   // synth samples at INT16 ceiling/floor
+    int      ringOverrunsPerSec = 0;   // samples dropped by audioRing.write() truncation
 
     std::atomic<bool> audioDebug { false };
 };
@@ -270,6 +290,10 @@ static void audioCallback(
         s->underruns.fetch_add(1, std::memory_order_relaxed);
     }
     s->cbSamplesRead.fetch_add(got, std::memory_order_relaxed);
+
+    // Capture entire hardware output buffer (including underrun zeros) for live WAV.
+    if (s->captureActive.load(std::memory_order_relaxed))
+        s->captureRing.write(out, static_cast<int>(frameCount));
 }
 
 // ---------------------------------------------------------------------------
@@ -439,7 +463,8 @@ static void applyCommand(const std::string &line, HeadlessState &state) {
             << "samples_read_per_sec="  << state.samplesReadPerSec                  << "\n"
             << "ring_fill="          << state.audioRing.available()                 << "\n"
             << "synth_input_buf="    << state.synthBufFill                          << "\n"
-            << "synth_clips_per_sec="<< state.synthClipsPerSec                      << "\n"
+            << "synth_clips_per_sec="    << state.synthClipsPerSec                   << "\n"
+            << "ring_overruns_per_sec=" << state.ringOverrunsPerSec                 << "\n"
             << "backfire="           << (state.backfireEnabled.load() ? "on":"off") << "\n"
             << "underruns="          << state.underruns.load()                      << "\n"
             << std::flush;
@@ -530,7 +555,8 @@ int main(int argc, char **argv) {
     const bool        benchmark    = argFlag(argc, argv, "--benchmark");
     const int         sampleRate   = std::stoi(argValue(argc, argv, "--sample-rate", "44100"));
     const int         periodFrames = std::stoi(argValue(argc, argv, "--period",      "512"));
-    const std::string wavPath      = argValue(argc, argv, "--write-wav",    "");
+    const std::string wavPath      = argValue(argc, argv, "--write-wav",      "");
+    const std::string liveWavPath  = argValue(argc, argv, "--write-live-wav", "");
     const int         wavSeconds   = std::stoi(argValue(argc, argv, "--wav-seconds", "30"));
     const bool        noDevice     = argFlag(argc, argv, "--no-audio-device");
 
@@ -684,9 +710,11 @@ int main(int argc, char **argv) {
     // 4. Open WAV file if requested
     // -----------------------------------------------------------------------
     WavWriter wavWriter;
+    WavWriter liveWavWriter;
     const uint32_t wavSamplesTarget =
         static_cast<uint32_t>(wavSeconds) * static_cast<uint32_t>(sampleRate);
-    bool wavDone = false;
+    bool wavDone     = false;
+    bool liveWavDone = false;
 
     if (!wavPath.empty()) {
         if (!wavWriter.open(wavPath.c_str(), sampleRate)) {
@@ -694,6 +722,15 @@ int main(int argc, char **argv) {
         } else {
             std::fprintf(stderr, "[WAV] Recording %d s to %s\n",
                          wavSeconds, wavPath.c_str());
+        }
+    }
+    if (!liveWavPath.empty()) {
+        if (!liveWavWriter.open(liveWavPath.c_str(), sampleRate)) {
+            std::cerr << "[headless] ERROR: cannot open live WAV: " << liveWavPath << "\n";
+        } else {
+            state.captureActive.store(true, std::memory_order_relaxed);
+            std::fprintf(stderr, "[LIVE-WAV] Capturing %d s (post-ring) to %s\n",
+                         wavSeconds, liveWavPath.c_str());
         }
     }
 
@@ -901,13 +938,38 @@ int main(int argc, char **argv) {
                 epochGenSamples += n;
             }
         } else {
-            // Normal engine synthesis drain
+            // Adaptive drain -- keep ring at ~50% fill.
+            //
+            // Root cause of crackling: ring fills to ~91% (15000/16384) because main
+            // loop drains the synth aggressively. With only 1384 free slots, any brief
+            // burst causes AudioRing.write() to truncate, creating a discontinuity.
+            //
+            // Fix: read at most drainMax samples from the synth per frame. Excess stays
+            // in the synth output buffer (up to 2000 samples). The synth rendering thread
+            // stalls when its output buffer is full -- no samples are discarded, so the
+            // audio stream has no gaps. The ring converges to ~50% fill in ~10 frames.
+            //
+            // P-controller: drainMax = consumed + (target - fill) / 8
+            //   consumed  = what the callback will read before next main loop iteration
+            //   (target-fill)/8 = gentle correction toward 50% fill (gain = 1/8)
+            const int kRingTarget = AudioRing::kSize / 2;          // 8192 samples = ~186 ms
+            const int ringFill    = state.audioRing.available();
+            const int consumed    = static_cast<int>(wallDt * sampleRate) + 32; // ~735 + margin
+            const int correction  = (kRingTarget - ringFill) / 8;
+            // drainMax >= 32 so synth thread is always ticking, even when ring is full.
+            const int drainMax    = std::max(32, consumed + correction);
+
             static int16_t drainBuf[2048];
-            int drained;
+            int drained = 0, drainedTotal = 0, lastToRead = 0;
             do {
-                drained = sim->readAudioOutput(2048, drainBuf);
+                const int toRead = std::min(2048, drainMax - drainedTotal);
+                lastToRead = toRead;
+                if (toRead <= 0) break;
+                drained = sim->readAudioOutput(toRead, drainBuf);
                 if (drained > 0) {
-                    // Write to WAV
+                    drainedTotal += drained;
+
+                    // Write to synth WAV (pre-ring; always full capture)
                     if (!wavDone && wavWriter.isOpen()) {
                         const uint32_t remaining = wavSamplesTarget - wavWriter.samplesWritten;
                         const int toWav = static_cast<int>(remaining) < drained
@@ -923,7 +985,8 @@ int main(int argc, char **argv) {
                                 state.running.store(false, std::memory_order_relaxed);
                         }
                     }
-                    // Write to ring (only if device is open)
+
+                    // Write to ring
                     if (!noDevice)
                         state.audioRing.write(drainBuf, drained);
 
@@ -939,13 +1002,33 @@ int main(int argc, char **argv) {
                         diagPrevSample = s;
                         epochHash = (epochHash << 5u) ^ (epochHash >> 27u)
                                     ^ static_cast<uint32_t>(static_cast<uint16_t>(s));
-                        // Count samples at INT16 ceiling/floor (synthesizer saturation)
                         if (s >= 32767 || s <= -32767) ++epochSynthClips;
                     }
                 }
-            } while (drained == 2048 && !state.running.load() == false);
-            // Note: "while drained == 2048" keeps draining; the extra check prevents
-            // spinning after quit is set (not strictly necessary but defensive).
+            } while (drained == lastToRead && drainedTotal < drainMax);
+        }
+
+        // ------------------------------------------------------------------
+        // Drain capture ring to live WAV (post-ring, exactly what callback sent)
+        // ------------------------------------------------------------------
+        if (!liveWavDone && liveWavWriter.isOpen()) {
+            static int16_t capBuf[2048];
+            int capDrained;
+            do {
+                capDrained = state.captureRing.read(capBuf, 2048);
+                if (capDrained > 0) {
+                    const uint32_t rem = wavSamplesTarget - liveWavWriter.samplesWritten;
+                    const int toW = static_cast<int>(rem) < capDrained
+                                   ? static_cast<int>(rem) : capDrained;
+                    if (toW > 0) liveWavWriter.write(capBuf, toW);
+                    if (liveWavWriter.samplesWritten >= wavSamplesTarget) {
+                        liveWavWriter.close();
+                        liveWavDone = true;
+                        state.captureActive.store(false, std::memory_order_relaxed);
+                        std::fprintf(stderr, "[LIVE-WAV] Done: %d s\n", wavSeconds);
+                    }
+                }
+            } while (capDrained == 2048);
         }
 
         // ------------------------------------------------------------------
@@ -967,14 +1050,15 @@ int main(int argc, char **argv) {
                 state.samplesReadPerSec = static_cast<int>(cbRead / snapElapsed);
                 state.synthBufFill      = static_cast<int>(
                     sim->getSynthesizerInputLatency() * static_cast<double>(sampleRate));
-                state.synthClipsPerSec  = epochSynthClips;
+                state.synthClipsPerSec   = epochSynthClips;
+                state.ringOverrunsPerSec = state.audioRing.getAndClearOverruns();
 
                 if (state.audioDebug.load(std::memory_order_relaxed)) {
                     std::fprintf(stderr,
                         "[AUDIO] rpm=%.0f sc=%.3f"
                         " rms=%.4f peak=%.4f leveler=%.5f"
                         " gen/s=%d read/s=%d ring=%d zcr=%.0f"
-                        " hash=%08X clips/s=%d underruns=%d%s\n",
+                        " hash=%08X synth_clips=%d overruns=%d underruns=%d%s\n",
                         engine->getRpm(),
                         engine->getThrottle(),
                         state.snapshotRms,
@@ -986,6 +1070,7 @@ int main(int argc, char **argv) {
                         static_cast<double>(state.zeroCrossRate),
                         state.audioHash,
                         state.synthClipsPerSec,
+                        state.ringOverrunsPerSec,
                         state.underruns.load(),
                         state.toneActive.load() ? " [TONE]" : "");
                 }
@@ -1043,12 +1128,18 @@ int main(int argc, char **argv) {
         ma_device_uninit(&maDevice);
     }
 
-    // Finalize WAV if still open (e.g. quit before wavSeconds elapsed)
+    // Finalize WAV files if still open (e.g. quit before wavSeconds elapsed)
     if (wavWriter.isOpen()) {
         std::fprintf(stderr, "[WAV] Finalizing %u samples (%.1f s)\n",
                      wavWriter.samplesWritten,
                      static_cast<double>(wavWriter.samplesWritten) / sampleRate);
         wavWriter.close();
+    }
+    if (liveWavWriter.isOpen()) {
+        std::fprintf(stderr, "[LIVE-WAV] Finalizing %u samples (%.1f s)\n",
+                     liveWavWriter.samplesWritten,
+                     static_cast<double>(liveWavWriter.samplesWritten) / sampleRate);
+        liveWavWriter.close();
     }
 
     sim->endAudioRenderingThread();
