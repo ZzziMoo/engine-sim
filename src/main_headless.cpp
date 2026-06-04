@@ -26,6 +26,19 @@
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846
 #endif
+
+// Winsock2 must be included before windows.h (pulled in by miniaudio).
+// WIN32_LEAN_AND_MEAN stops windows.h from pulling in winsock.h, which
+// would conflict with winsock2.h.
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  pragma comment(lib, "ws2_32.lib")
+#endif
+
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 
@@ -285,6 +298,15 @@ struct HeadlessState {
 
     std::atomic<bool> audioDebug { false };
     std::atomic<bool> rpmDebug   { false };
+    std::atomic<bool> udpDebug   { false };
+
+    // UDP diagnostics
+    std::atomic<bool> udpBindOk          { false };
+    std::atomic<int>  udpPacketsReceived { 0     };
+    std::atomic<int>  udpCommandsApplied { 0     };
+    // lastUdpCmd is written by UDP thread and read by status -- minor race is
+    // acceptable: it is diagnostic-only and never safety-critical.
+    char lastUdpCmd[128] = {};
 };
 
 // ---------------------------------------------------------------------------
@@ -457,6 +479,11 @@ static void applyCommand(const std::string &line, HeadlessState &state) {
         if (ss >> sub)
             state.rpmDebug.store(sub == "on", std::memory_order_relaxed);
 
+    } else if (cmd == "udp_debug") {
+        std::string sub;
+        if (ss >> sub)
+            state.udpDebug.store(sub == "on", std::memory_order_relaxed);
+
     } else if (cmd == "rpm_force_rate") {
         double v = 0.08;
         if (ss >> v)
@@ -533,6 +560,10 @@ static void applyCommand(const std::string &line, HeadlessState &state) {
             << "rpm_force_mode="     << (state.rpmForceMode.load() ? "rate_limited" : "off")      << "\n"
             << "rpm_force_rate="     << state.rpmForceRate.load()                                  << "\n"
             << "rpm_error="          << (state.targetRpm.load() - rpm)                             << "\n"
+            << "udp_bind_ok="        << (state.udpBindOk.load() ? "yes" : "no")                   << "\n"
+            << "udp_packets_received=" << state.udpPacketsReceived.load()                          << "\n"
+            << "udp_commands_applied=" << state.udpCommandsApplied.load()                          << "\n"
+            << "last_udp_command="   << state.lastUdpCmd                                           << "\n"
             << "underruns="          << state.underruns.load()                                     << "\n"
             << std::flush;
     }
@@ -547,35 +578,157 @@ static void stdinThread(HeadlessState &state) {
         applyCommand(line, state);
 }
 
-#ifdef __unix__
+// ---------------------------------------------------------------------------
+// Apply all newline-delimited commands found in a NUL-terminated buffer.
+// Handles \r\n line endings and packets without a trailing newline.
+// ---------------------------------------------------------------------------
+static void applyPacket(char *buf, int n, HeadlessState &state,
+                        const char *srcTag, bool debug)
+{
+    buf[n] = '\0';
+    state.udpPacketsReceived.fetch_add(1, std::memory_order_relaxed);
+
+    if (debug)
+        std::fprintf(stderr, "[UDP] pkt src=%s bytes=%d raw=[%s]\n",
+                     srcTag, n, buf);
+
+    for (char *p = buf; *p; ) {
+        char *nl = std::strchr(p, '\n');
+        if (nl) *nl = '\0';
+        char *cr = std::strchr(p, '\r');
+        if (cr) *cr = '\0';
+
+        if (*p) {
+            if (debug)
+                std::fprintf(stderr, "[UDP] cmd [%s]\n", p);
+            applyCommand(std::string(p), state);
+            state.udpCommandsApplied.fetch_add(1, std::memory_order_relaxed);
+            std::strncpy(state.lastUdpCmd, p, sizeof(state.lastUdpCmd) - 1);
+            state.lastUdpCmd[sizeof(state.lastUdpCmd) - 1] = '\0';
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+}
+
 static void udpThread(HeadlessState &state, int port) {
-    const int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        std::cerr << "[headless] UDP socket failed\n";
+    char buf[512];
+
+#ifdef _WIN32
+    // -----------------------------------------------------------------------
+    // Windows Winsock2
+    // -----------------------------------------------------------------------
+    WSADATA wsa{};
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        std::fprintf(stderr, "[UDP] WSAStartup failed (error %d)\n",
+                     WSAGetLastError());
+        state.udpBindOk.store(false, std::memory_order_relaxed);
         return;
     }
-    struct sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_port        = htons(static_cast<uint16_t>(port));
-    addr.sin_addr.s_addr = INADDR_ANY;
-    if (bind(sock, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) < 0) {
-        std::cerr << "[headless] UDP bind failed on port " << port << "\n";
+
+    const SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == INVALID_SOCKET) {
+        std::fprintf(stderr, "[UDP] socket() failed (error %d)\n",
+                     WSAGetLastError());
+        state.udpBindOk.store(false, std::memory_order_relaxed);
+        WSACleanup();
+        return;
+    }
+
+    struct sockaddr_in saddr{};
+    saddr.sin_family      = AF_INET;
+    saddr.sin_port        = htons(static_cast<u_short>(port));
+    saddr.sin_addr.s_addr = INADDR_ANY;
+    if (bind(sock, reinterpret_cast<struct sockaddr *>(&saddr), sizeof(saddr))
+            == SOCKET_ERROR) {
+        std::fprintf(stderr,
+                     "[UDP] bind failed on 0.0.0.0:%d  (error %d)\n"
+                     "      Is the port already in use?\n",
+                     port, WSAGetLastError());
+        state.udpBindOk.store(false, std::memory_order_relaxed);
+        closesocket(sock);
+        WSACleanup();
+        return;
+    }
+
+    DWORD timeout_ms = 1000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char *>(&timeout_ms), sizeof(timeout_ms));
+
+    state.udpBindOk.store(true, std::memory_order_relaxed);
+    std::fprintf(stderr, "[UDP] bound 0.0.0.0:%d  (Windows/Winsock2)\n", port);
+
+    struct sockaddr_in from{};
+    int fromLen = static_cast<int>(sizeof(from));
+
+    while (state.running.load()) {
+        const int n = recvfrom(sock, buf, static_cast<int>(sizeof(buf)) - 1,
+                               0,
+                               reinterpret_cast<struct sockaddr *>(&from),
+                               &fromLen);
+        if (n > 0) {
+            char srcTag[48] = {};
+            char srcIp[INET_ADDRSTRLEN] = {};
+            inet_ntop(AF_INET, &from.sin_addr, srcIp, sizeof(srcIp));
+            std::snprintf(srcTag, sizeof(srcTag), "%s:%u",
+                          srcIp, ntohs(from.sin_port));
+            applyPacket(buf, n, state, srcTag,
+                        state.udpDebug.load(std::memory_order_relaxed));
+        }
+    }
+
+    closesocket(sock);
+    WSACleanup();
+
+#else
+    // -----------------------------------------------------------------------
+    // POSIX / Unix
+    // -----------------------------------------------------------------------
+    const int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        std::fprintf(stderr, "[UDP] socket() failed\n");
+        state.udpBindOk.store(false, std::memory_order_relaxed);
+        return;
+    }
+
+    struct sockaddr_in saddr{};
+    saddr.sin_family      = AF_INET;
+    saddr.sin_port        = htons(static_cast<uint16_t>(port));
+    saddr.sin_addr.s_addr = INADDR_ANY;
+    if (bind(sock, reinterpret_cast<struct sockaddr *>(&saddr), sizeof(saddr)) < 0) {
+        std::fprintf(stderr,
+                     "[UDP] bind failed on 0.0.0.0:%d\n"
+                     "      Is the port already in use?\n", port);
+        state.udpBindOk.store(false, std::memory_order_relaxed);
         close(sock);
         return;
     }
+
     struct timeval tv{}; tv.tv_sec = 1;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    std::cerr << "[headless] UDP control on port " << port << "\n";
-    char buf[256];
+
+    state.udpBindOk.store(true, std::memory_order_relaxed);
+    std::fprintf(stderr, "[UDP] bound 0.0.0.0:%d  (POSIX)\n", port);
+
+    struct sockaddr_in from{};
+    socklen_t fromLen = sizeof(from);
+
     while (state.running.load()) {
-        const ssize_t n = recv(sock, buf, sizeof(buf) - 1, 0);
-        if (n > 0) { buf[n] = '\0'; applyCommand(std::string(buf), state); }
+        const ssize_t n = recvfrom(sock, buf, sizeof(buf) - 1, 0,
+                                   reinterpret_cast<struct sockaddr *>(&from),
+                                   &fromLen);
+        if (n > 0) {
+            char srcTag[48] = {};
+            std::snprintf(srcTag, sizeof(srcTag), "%s:%u",
+                          inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+            applyPacket(buf, static_cast<int>(n), state, srcTag,
+                        state.udpDebug.load(std::memory_order_relaxed));
+        }
     }
+
     close(sock);
-}
-#else
-static void udpThread(HeadlessState &, int) {}
 #endif
+}
 
 // ---------------------------------------------------------------------------
 // Load impulse response
