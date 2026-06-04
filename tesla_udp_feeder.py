@@ -6,7 +6,13 @@ Feeds speed / pedal / brake state to engine-sim-headless over UDP.
 Usage:
     python tesla_udp_feeder.py --mode tesla3p          # simulated Model 3 P run
     python tesla_udp_feeder.py --mode manual            # edit MANUAL_* below
+    python tesla_udp_feeder.py --mode can \\
+        --dbc Model3CAN.dbc --channel can0 --bustype socketcan
+
     python tesla_udp_feeder.py --host 192.168.1.5 --port 9999 --hz 50 --mode tesla3p
+
+CAN mode requirements:
+    pip install python-can cantools
 
 engine-sim-headless must be running with:
     engine-sim-headless --script <engine.mr> [--port 9999]
@@ -14,6 +20,8 @@ engine-sim-headless must be running with:
 
 import argparse
 import socket
+import sys
+import threading
 import time
 
 # ---------------------------------------------------------------------------
@@ -60,30 +68,101 @@ TESLA3P_DURATION = 27.0
 
 
 # ---------------------------------------------------------------------------
-# TODO: Tesla CAN integration
+# CAN signal mapping  (Model 3 / Model Y)
 #
-# Replace the simulated values in the main loop with real decoded CAN signals.
-# Suggested mapping (Model 3 / Model Y CAN):
+#   Message 0x257 (599):
+#     DI_vehicleSpeed   kph  -> speed_mph = value * 0.621371
 #
-#   Message ID  Signal                  -> variable
-#   ----------  ------                  -----------
-#   0x118       DI_vehicleSpeed (kph)   -> speed_mph = value * 0.621371
-#   0x118       DI_accelPedalPos (0-255 or 0-100%) -> pedal_pct = value
-#   0x20A       VCRIGHT_brakeApplied (bool) or
-#   0x20A       VCRIGHT_brakePedalPos    -> brake = value  (0.0–1.0)
-#
-# Libraries to consider:
-#   python-can  (pip install python-can)
-#   cantools    (pip install cantools)  + Tesla DBC file
-#
-# Example stub:
-#   import can
-#   bus = can.interface.Bus(channel='can0', bustype='socketcan')
-#   msg = bus.recv(timeout=0.05)
-#   if msg and msg.arbitration_id == 0x118:
-#       speed_mph = decode_speed(msg.data) * 0.621371
-#       pedal_pct = decode_pedal(msg.data)
+#   Message 0x118 (280):
+#     DI_accelPedalPos  0–100 % -> pedal_pct
+#     DI_brakePedalState bool/enum -> brake = 1.0 if ON else 0.0
 # ---------------------------------------------------------------------------
+
+# IDs we care about (set for O(1) lookup in the hot path)
+_CAN_TARGET_IDS = frozenset({0x118, 0x257})
+
+
+def _brake_value(raw) -> float:
+    """Normalise DBC-decoded brake signal to 0.0 / 1.0."""
+    if isinstance(raw, bool):
+        return 1.0 if raw else 0.0
+    if isinstance(raw, (int, float)):
+        return 1.0 if raw else 0.0
+    if isinstance(raw, str):
+        return 1.0 if raw.lower() in ("on", "active", "1", "true", "applied") else 0.0
+    return 0.0
+
+
+class CanState:
+    """Thread-safe store for the latest decoded CAN values."""
+
+    def __init__(self):
+        self._lock      = threading.Lock()
+        self._speed_mph = 0.0
+        self._pedal_pct = 0.0
+        self._brake     = 0.0
+        # Track which signals have been received at least once
+        self._got_speed = False
+        self._got_pedal = False
+        self._got_brake = False
+
+    def update_speed(self, kph: float) -> None:
+        with self._lock:
+            self._speed_mph = kph * 0.621371
+            self._got_speed = True
+
+    def update_pedal(self, pct: float) -> None:
+        with self._lock:
+            self._pedal_pct = max(0.0, min(100.0, float(pct)))
+            self._got_pedal = True
+
+    def update_brake(self, raw) -> None:
+        with self._lock:
+            self._brake     = _brake_value(raw)
+            self._got_brake = True
+
+    def get(self) -> tuple:
+        """Return (speed_mph, pedal_pct, brake) — safe defaults until first update."""
+        with self._lock:
+            return self._speed_mph, self._pedal_pct, self._brake
+
+    def received_flags(self) -> tuple:
+        """Return (got_speed, got_pedal, got_brake) for startup diagnostics."""
+        with self._lock:
+            return self._got_speed, self._got_pedal, self._got_brake
+
+
+def _can_reader(bus, db, state: CanState) -> None:
+    """
+    Background thread: read CAN frames, decode via DBC, update CanState.
+    Never raises — any error is swallowed so the thread keeps running.
+    """
+    warned_ids: set = set()   # suppress repeated decode-error prints per ID
+
+    while True:
+        try:
+            msg = bus.recv(timeout=0.1)
+            if msg is None or msg.arbitration_id not in _CAN_TARGET_IDS:
+                continue
+
+            try:
+                signals = db.decode_message(msg.arbitration_id, msg.data)
+            except Exception:
+                if msg.arbitration_id not in warned_ids:
+                    warned_ids.add(msg.arbitration_id)
+                    print(f"[CAN] warning: could not decode 0x{msg.arbitration_id:03X} "
+                          f"(check DBC has this message)", file=sys.stderr)
+                continue
+
+            if "DI_vehicleSpeed" in signals:
+                state.update_speed(float(signals["DI_vehicleSpeed"]))
+            if "DI_accelPedalPos" in signals:
+                state.update_pedal(float(signals["DI_accelPedalPos"]))
+            if "DI_brakePedalState" in signals:
+                state.update_brake(signals["DI_brakePedalState"])
+
+        except Exception:
+            pass  # never let reader crash; bus errors are transient
 
 
 def interp_keyframes(t: float, keyframes: list) -> tuple:
@@ -202,6 +281,93 @@ def run_manual(sock: socket.socket, addr: tuple, hz: float) -> None:
         print("\n[feeder] stopped")
 
 
+def run_can(
+    sock: socket.socket,
+    addr: tuple,
+    hz: float,
+    dbc_path: str,
+    channel: str,
+    bustype: str,
+) -> None:
+    """Read live CAN data and forward to engine-sim-headless at a fixed rate."""
+    try:
+        import can
+        import cantools
+    except ImportError as exc:
+        sys.exit(
+            "[feeder] CAN mode requires python-can and cantools.\n"
+            "  pip install python-can cantools\n"
+            f"  ({exc})"
+        )
+
+    # Load DBC
+    print(f"[feeder] Loading DBC: {dbc_path}")
+    try:
+        db = cantools.database.load_file(dbc_path)
+    except FileNotFoundError:
+        sys.exit(f"[feeder] DBC file not found: {dbc_path}")
+    except Exception as exc:
+        sys.exit(f"[feeder] Failed to load DBC: {exc}")
+
+    # Warn if expected messages are absent from the DBC
+    expected = {0x118: "0x118", 0x257: "0x257"}
+    for mid, label in expected.items():
+        try:
+            db.get_message_by_frame_id(mid)
+        except KeyError:
+            print(f"[CAN] warning: message {label} not found in DBC — "
+                  "related signals will not be decoded", file=sys.stderr)
+
+    # Open CAN bus
+    print(f"[feeder] Opening CAN bus: channel={channel} bustype={bustype}")
+    try:
+        bus = can.interface.Bus(channel=channel, bustype=bustype)
+    except Exception as exc:
+        sys.exit(f"[feeder] Failed to open CAN bus: {exc}")
+
+    state = CanState()
+
+    reader_thread = threading.Thread(
+        target=_can_reader,
+        args=(bus, db, state),
+        daemon=True,   # exits automatically when main thread ends
+        name="can-reader",
+    )
+    reader_thread.start()
+
+    period         = 1.0 / hz
+    print_interval = 0.5
+    t_print        = time.monotonic()
+
+    print(f"[feeder] CAN mode running at {hz:.0f} Hz  ->  {addr[0]}:{addr[1]}")
+    print("  Waiting for CAN frames… (Ctrl-C to stop)")
+    print(f"  {'speed':>8}  {'pedal':>7}  {'brake':>6}  {'flags':>12}")
+    print("  " + "-" * 42)
+
+    try:
+        while True:
+            t_frame = time.monotonic()
+
+            speed, pedal, brake = state.get()
+            send_vehicle_state(sock, addr, speed, pedal, brake)
+
+            if t_frame - t_print >= print_interval:
+                t_print = t_frame
+                gs, gp, gb = state.received_flags()
+                flags = f"{'S' if gs else '-'}{'P' if gp else '-'}{'B' if gb else '-'}"
+                print(f"  {speed:8.1f}  {pedal:7.1f}  {brake:6.3f}  {flags:>12}")
+
+            sleep_until = t_frame + period
+            now = time.monotonic()
+            if sleep_until > now:
+                time.sleep(sleep_until - now)
+
+    except KeyboardInterrupt:
+        print("\n[feeder] stopped")
+    finally:
+        bus.shutdown()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="UDP feeder for engine-sim-headless (EV / Tesla sound project)",
@@ -212,9 +378,24 @@ def main() -> None:
                         help="UDP port (default: 9999)")
     parser.add_argument("--hz",   type=float, default=20.0,
                         help="update rate in Hz (default: 20)")
-    parser.add_argument("--mode", choices=["tesla3p", "manual"], default="tesla3p",
-                        help="tesla3p = replay 3P launch profile; "
-                             "manual = send MANUAL_* constants (default: tesla3p)")
+    parser.add_argument(
+        "--mode",
+        choices=["tesla3p", "manual", "can"],
+        default="tesla3p",
+        help=(
+            "tesla3p = replay 3P launch profile; "
+            "manual = send MANUAL_* constants; "
+            "can = decode live CAN bus (requires --dbc) "
+            "(default: tesla3p)"
+        ),
+    )
+    # CAN-mode arguments (ignored for other modes)
+    parser.add_argument("--dbc",     default="Model3CAN.dbc",
+                        help="DBC file path (CAN mode, default: Model3CAN.dbc)")
+    parser.add_argument("--channel", default="can0",
+                        help="CAN channel (CAN mode, default: can0)")
+    parser.add_argument("--bustype", default="socketcan",
+                        help="python-can bus type (CAN mode, default: socketcan)")
     args = parser.parse_args()
 
     addr = (args.host, args.port)
@@ -224,8 +405,10 @@ def main() -> None:
 
         if args.mode == "tesla3p":
             run_tesla3p(sock, addr, args.hz)
-        else:
+        elif args.mode == "manual":
             run_manual(sock, addr, args.hz)
+        else:  # can
+            run_can(sock, addr, args.hz, args.dbc, args.channel, args.bustype)
 
 
 if __name__ == "__main__":
