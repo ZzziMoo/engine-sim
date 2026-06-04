@@ -799,14 +799,13 @@ struct BackfireGen {
     float sinePhase         = 0.0f;
     float lpAlpha           = 0.0f;
     float lpState           = 0.0f;
-    float burstVolume       = 0.0f;   // per-burst (includes ±20% variation)
-    float seqBaseVolume     = 0.0f;   // base vol for the sequence (for gap→armBurst)
+    float burstVolume       = 0.0f;
     bool  isMild            = true;
     float noiseMix          = 0.60f;
     float sineMix           = 0.35f;
     float volScale          = 0.65f;
 
-    // Sequence bookkeeping
+    // Aggressive multi-burst bookkeeping
     int burstCountTarget = 1;
     int burstIdx         = 0;
     int gapSamplesRem    = 0;
@@ -824,28 +823,21 @@ struct BackfireGen {
 
     unsigned lcg() { return rng = rng * 1664525u + 1013904223u; }
 
-    void armBurst(bool mild, float baseVol) {
-        // Duration: mild 25–80 ms, aggressive 25–55 ms (snappier pops)
-        const unsigned r1      = lcg();
-        const int durationMs   = mild
-            ? (25 + static_cast<int>(r1 % 56))   // 25..80 ms
-            : (25 + static_cast<int>(r1 % 31));   // 25..55 ms
+    void armBurst(bool mild, float vol) {
+        const unsigned r1 = lcg();
+        const int durationMs = 25 + static_cast<int>(r1 % 56); // 25..80 ms
         burstTotalSamples = durationMs * sampleRate / 1000;
         burstSampleIdx    = 0;
 
-        // Resonant frequency
         const unsigned r2  = lcg();
         const float freqHz = mild
-            ? ( 80.0f + static_cast<float>(r2 %  71))   // 80..150 Hz -- deep thud
+            ? (80.0f  + static_cast<float>(r2 % 71))    // 80..150 Hz  -- deep thud
             : (200.0f + static_cast<float>(r2 % 201));  // 200..400 Hz -- sharp crack
 
-        // Decay time: mild 10–19 ms, aggressive 8–27 ms (wider character range)
-        const unsigned r3  = lcg();
-        const float tauMs  = mild
-            ? (10.0f + static_cast<float>(r3 % 10))   // 10..19 ms
-            : ( 8.0f + static_cast<float>(r3 % 20));  //  8..27 ms
-        const float tauSec = tauMs * 0.001f;
-        const float tauN   = tauSec * 0.65f;
+        const unsigned r3   = lcg();
+        const float tauMs   = 10.0f + static_cast<float>(r3 % 10); // 10..19 ms
+        const float tauSec  = tauMs * 0.001f;
+        const float tauN    = tauSec * 0.65f; // noise decays faster than sine
 
         sineEnvAmp    = 1.0f;
         noiseEnvAmp   = 1.0f;
@@ -854,46 +846,39 @@ struct BackfireGen {
         sinePhaseInc  = 2.0f * static_cast<float>(M_PI) * freqHz
                         / static_cast<float>(sampleRate);
         sinePhase     = 0.0f;
-        lpAlpha       = mild ? 0.15f : 0.40f;
+        lpAlpha       = mild ? 0.15f : 0.40f; // mild = heavier lowpass
         lpState       = 0.0f;
-
-        // Per-burst amplitude variation ±20%: factor in [0.80, 1.20]
-        const unsigned r4    = lcg();
-        const float ampScale = 0.80f + static_cast<float>(r4 & 0xFF) * (0.40f / 255.0f);
-        burstVolume   = baseVol * ampScale;
-
-        isMild    = mild;
-        noiseMix  = mild ? 0.60f : 0.50f;
-        sineMix   = mild ? 0.35f : 0.50f;
-        volScale  = mild ? 0.65f : 1.00f;
-        phase     = Phase::Burst;
-    }
-
-    void _startSequence(bool mild, float vol, int cooldownMs) {
-        isMild         = mild;
-        seqBaseVolume  = vol;
-        burstIdx       = 0;
-        gapSamplesRem  = 0;
-        phase          = Phase::Idle;
-        // Aggressive: 3–6 bursts per trigger event
-        const unsigned r0 = lcg();
-        burstCountTarget  = mild ? 1 : (3 + static_cast<int>(r0 % 4));
-        cooldownSamplesRem = cooldownMs * sampleRate / 1000;
-        armBurst(mild, vol);
-        ++backfiresFired;
+        burstVolume   = vol;
+        isMild        = mild;
+        noiseMix      = mild ? 0.60f : 0.50f;
+        sineMix       = mild ? 0.35f : 0.50f;
+        volScale      = mild ? 0.65f : 1.00f;
+        phase         = Phase::Burst;
     }
 
     // Trigger a sequence; silently ignored if cooldown is still running.
     void trigger(bool mild, float vol, int cooldownMs) {
         if (cooldownSamplesRem > 0) return;
-        _startSequence(mild, vol, cooldownMs);
+        isMild = mild;
+        const unsigned r0 = lcg();
+        burstCountTarget   = mild ? 1 : (2 + static_cast<int>(r0 % 2)); // 1 mild / 2-3 aggressive
+        burstIdx           = 0;
+        gapSamplesRem      = 0;
+        cooldownSamplesRem = cooldownMs * sampleRate / 1000;
+        armBurst(mild, vol);
+        ++backfiresFired;
     }
 
     // Force-trigger for "backfire test": bypasses cooldown and all conditions.
-    // Generates a full sequence (same as trigger) so the test sounds realistic.
     void forceTest(bool mild, float vol, int cooldownMs) {
         cooldownSamplesRem = 0;
-        _startSequence(mild, vol, cooldownMs);
+        burstCountTarget   = 1;
+        burstIdx           = 0;
+        gapSamplesRem      = 0;
+        phase              = Phase::Idle;
+        armBurst(mild, vol);
+        cooldownSamplesRem = cooldownMs * sampleRate / 1000;
+        ++backfiresFired;
     }
 
     void tickCooldown(int samples) {
@@ -913,7 +898,7 @@ struct BackfireGen {
             if (phase == Phase::Gap) {
                 --gapSamplesRem;
                 if (gapSamplesRem <= 0) {
-                    if (burstIdx < burstCountTarget) armBurst(isMild, seqBaseVolume);
+                    if (burstIdx < burstCountTarget) armBurst(isMild, burstVolume);
                     else                             phase = Phase::Idle;
                 }
                 continue;
@@ -944,10 +929,9 @@ struct BackfireGen {
 
             if (++burstSampleIdx >= burstTotalSamples) {
                 ++burstIdx;
-                if (burstIdx < burstCountTarget) {
-                    // Gap between bursts: 30–100 ms
+                if (!isMild && burstIdx < burstCountTarget) {
                     const unsigned gr = lcg();
-                    gapSamplesRem = (30 + static_cast<int>(gr % 71)) * sampleRate / 1000;
+                    gapSamplesRem = (20 + static_cast<int>(gr % 41)) * sampleRate / 1000;
                     phase = Phase::Gap;
                 } else {
                     phase = Phase::Idle;
