@@ -258,15 +258,20 @@ struct HeadlessState {
     std::atomic<int>  pendingStarter  { -1 };
     std::atomic<int>  pendingGear     { -2 };
 
-    std::atomic<bool>  backfireEnabled     { false };
-    std::atomic<float> backfireChance      { 0.25f };
-    std::atomic<float> backfireVolume      { 0.25f };
-    std::atomic<int>   backfireRpmMin      { 3000  };
-    std::atomic<int>   backfireCooldownMs  { 180   };
-    std::atomic<int>   backfireStyle       { 0     }; // 0=mild, 1=aggressive
-    std::atomic<int>   backfireCount       { 0     }; // total pops triggered
-    std::atomic<bool>  backfireTestPending { false };
-    int                backfiresPerSec     = 0;       // snapshot (main thread only)
+    std::atomic<bool>  backfireEnabled      { false };
+    std::atomic<float> backfireChance       { 0.25f };
+    std::atomic<float> backfireVolume       { 0.25f };
+    std::atomic<int>   backfireRpmMin       { 3000  };
+    std::atomic<int>   backfireCooldownMs   { 180   };
+    std::atomic<int>   backfireStyle        { 0     }; // 0=mild, 1=aggressive
+    std::atomic<int>   backfireCount        { 0     }; // total pops (after chance)
+    std::atomic<int>   backfireTriggerCount { 0     }; // conditions met (before chance)
+    std::atomic<bool>  backfireTestPending  { false };
+    std::atomic<bool>  backfireDebug        { false };
+    int                backfiresPerSec      = 0;       // snapshot (main thread only)
+    // Diagnostic snapshots written by main loop, read by status (minor race OK).
+    double             prevPedalSnapshot    = 0.0;
+    char               lastBackfireReason[96] = {};
 
     std::atomic<bool>   driveTestActive { false };
 
@@ -429,7 +434,12 @@ static void applyCommand(const std::string &line, HeadlessState &state) {
         if (!(ss >> sub)) return;
         if      (sub == "on")   state.backfireEnabled.store(true,  std::memory_order_relaxed);
         else if (sub == "off")  state.backfireEnabled.store(false, std::memory_order_relaxed);
-        else if (sub == "test") state.backfireTestPending.store(true, std::memory_order_relaxed);
+        else if (sub == "test")  state.backfireTestPending.store(true, std::memory_order_relaxed);
+        else if (sub == "debug") {
+            std::string arg;
+            if (ss >> arg)
+                state.backfireDebug.store(arg == "on", std::memory_order_relaxed);
+        }
         else if (sub == "chance") {
             double v = 0.25;
             if (ss >> v)
@@ -551,12 +561,15 @@ static void applyCommand(const std::string &line, HeadlessState &state) {
             << "synth_input_buf="    << state.synthBufFill                          << "\n"
             << "synth_clips_per_sec="    << state.synthClipsPerSec                   << "\n"
             << "ring_overruns_per_sec=" << state.ringOverrunsPerSec                 << "\n"
-            << "backfire="             << (state.backfireEnabled.load() ? "on" : "off")             << "\n"
-            << "backfire_style="     << (state.backfireStyle.load() == 0 ? "mild" : "aggressive") << "\n"
-            << "backfire_count="     << state.backfireCount.load()                                 << "\n"
-            << "backfire_chance="    << state.backfireChance.load()                                << "\n"
-            << "backfire_volume="    << state.backfireVolume.load()                                << "\n"
-            << "backfire_cooldown_ms=" << state.backfireCooldownMs.load()                          << "\n"
+            << "backfire="               << (state.backfireEnabled.load() ? "on" : "off")             << "\n"
+            << "backfire_style="       << (state.backfireStyle.load() == 0 ? "mild" : "aggressive") << "\n"
+            << "backfire_count="       << state.backfireCount.load()                                 << "\n"
+            << "backfire_trigger_count=" << state.backfireTriggerCount.load()                        << "\n"
+            << "backfire_chance="      << state.backfireChance.load()                                << "\n"
+            << "backfire_volume="      << state.backfireVolume.load()                                << "\n"
+            << "backfire_cooldown_ms=" << state.backfireCooldownMs.load()                            << "\n"
+            << "prev_pedal="           << state.prevPedalSnapshot                                    << "\n"
+            << "last_backfire_reason=" << state.lastBackfireReason                                   << "\n"
             << "rpm_force_mode="     << (state.rpmForceMode.load() ? "rate_limited" : "off")      << "\n"
             << "rpm_force_rate="     << state.rpmForceRate.load()                                  << "\n"
             << "rpm_error="          << (state.targetRpm.load() - rpm)                             << "\n"
@@ -1473,26 +1486,63 @@ int main(int argc, char **argv) {
                 const float  vol    = state.backfireVolume.load(std::memory_order_relaxed);
                 const int    cdMs   = state.backfireCooldownMs.load(std::memory_order_relaxed);
                 const bool   mild   = (state.backfireStyle.load(std::memory_order_relaxed) == 0);
+                const bool   dbg    = state.backfireDebug.load(std::memory_order_relaxed);
 
-                // Trigger: pedal was floored, now lifted; engine still spinning
-                const bool pedalDropped = (prevPedal > 70.0 && pedal < 15.0);
-                const bool rapidDrop    = ((prevPedal - pedal) > 55.0);
-                const bool brakeActive  = (brake > 0.2);
+                // Trigger: meaningful lift-off from medium-to-high throttle at speed.
+                // prevPedal > 40 catches partial-throttle lifts (sport driving, regen).
+                // pedal < 5 means fully (or almost fully) released.
+                // No brake requirement -- lift-off itself is the signal.
+                const bool liftOff = (prevPedal > 40.0 && pedal < 5.0);
 
-                if (pedalDropped && rpm > static_cast<double>(rpmMin)
-                        && (brakeActive || rapidDrop)
+                if (liftOff && rpm > static_cast<double>(rpmMin)
                         && backfireGen.cooldownDone()) {
+                    state.backfireTriggerCount.fetch_add(1, std::memory_order_relaxed);
+
                     const float roll = static_cast<float>(std::rand())
                                        / static_cast<float>(RAND_MAX);
                     if (roll < chance) {
                         backfireGen.trigger(mild, vol, cdMs);
                         state.backfireCount.fetch_add(1, std::memory_order_relaxed);
                         ++epochBackfires;
+                        if (dbg) {
+                            char reason[96];
+                            std::snprintf(reason, sizeof(reason),
+                                "triggered (roll=%.2f < chance=%.2f)", roll, chance);
+                            std::strncpy(state.lastBackfireReason, reason,
+                                         sizeof(state.lastBackfireReason) - 1);
+                            std::fprintf(stderr,
+                                "[BF] prev=%.1f cur=%.1f rpm=%.0f triggered=yes"
+                                " reason=%s\n",
+                                prevPedal, pedal, rpm, reason);
+                        } else {
+                            std::snprintf(state.lastBackfireReason,
+                                          sizeof(state.lastBackfireReason),
+                                          "triggered (roll=%.2f)", roll);
+                        }
+                    } else {
+                        if (dbg)
+                            std::fprintf(stderr,
+                                "[BF] prev=%.1f cur=%.1f rpm=%.0f triggered=no"
+                                " reason=chance_miss (roll=%.2f >= %.2f)\n",
+                                prevPedal, pedal, rpm, roll, chance);
+                        std::snprintf(state.lastBackfireReason,
+                                      sizeof(state.lastBackfireReason),
+                                      "chance_miss (roll=%.2f >= %.2f)", roll, chance);
                     }
+                } else if (dbg && (prevPedal > 40.0 || pedal < 5.0)) {
+                    // Only print when at least one condition is interesting
+                    const char *reason =
+                        !liftOff          ? "no_lift_off" :
+                        rpm <= rpmMin     ? "rpm_low"     : "cooldown";
+                    std::fprintf(stderr,
+                        "[BF] prev=%.1f cur=%.1f rpm=%.0f triggered=no"
+                        " reason=%s\n",
+                        prevPedal, pedal, rpm, reason);
                 }
             }
 
             backfireGen.tickCooldown(static_cast<int>(wallDt * sampleRate));
+            state.prevPedalSnapshot = prevPedal;
             prevPedal = pedal;
         }
 
