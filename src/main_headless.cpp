@@ -8,6 +8,14 @@
 //             [--sample-rate 44100] [--period 512]
 //             [--write-wav out.wav] [--wav-seconds 30]
 //             [--no-audio-device]
+//             [--pi-mode]
+//
+// Pi-mode optimisations (--pi-mode):
+//   - sim frequency capped to 4000 Hz  (default engine scripts: ~10000 Hz)
+//   - sample rate defaulted to 22050 Hz (halves synthesis work)
+//   - audio period defaulted to 1024 frames
+//   - main loop rate reduced to 30 Hz
+//   - per-sample diagnostic inner loop skipped (epochHash / RMS / ZCR)
 //
 // Diagnostic flags:
 //   --write-wav out.wav      capture synthesis output to a WAV file (pre-ring)
@@ -1004,12 +1012,16 @@ static void dtInterp(double t, double &speedOut, double &pedalOut, double &brake
 // main
 // ---------------------------------------------------------------------------
 int main(int argc, char **argv) {
+    // --pi-mode must be parsed first; it sets defaults for sample-rate/period.
+    const bool        piMode       = argFlag(argc, argv, "--pi-mode");
     const std::string scriptPath   = argValue(argc, argv, "--script",      "../assets/main.mr");
     const int         udpPort      = std::stoi(argValue(argc, argv, "--port",        "9999"));
     const double      initThrottle = std::stod(argValue(argc, argv, "--throttle",    "0.5"));
     const bool        benchmark    = argFlag(argc, argv, "--benchmark");
-    const int         sampleRate   = std::stoi(argValue(argc, argv, "--sample-rate", "44100"));
-    const int         periodFrames = std::stoi(argValue(argc, argv, "--period",      "512"));
+    const int         sampleRate   = std::stoi(argValue(argc, argv, "--sample-rate",
+                                        piMode ? "22050" : "44100"));
+    const int         periodFrames = std::stoi(argValue(argc, argv, "--period",
+                                        piMode ? "1024"  : "512"));
     const std::string wavPath      = argValue(argc, argv, "--write-wav",      "");
     const std::string liveWavPath  = argValue(argc, argv, "--write-live-wav", "");
     const int         wavSeconds   = std::stoi(argValue(argc, argv, "--wav-seconds", "30"));
@@ -1094,6 +1106,16 @@ int main(int argc, char **argv) {
     Simulator *sim = engine->createSimulator(vehicle, transmission);
     engine->calculateDisplacement();
     sim->setSimulationFrequency(static_cast<int>(engine->getSimulationFrequency()));
+
+    if (piMode) {
+        constexpr int kPiMaxSimHz = 4000;
+        const int orig = sim->getSimulationFrequency();
+        if (orig > kPiMaxSimHz) {
+            sim->setSimulationFrequency(kPiMaxSimHz);
+            std::fprintf(stderr, "[PI-MODE] sim_freq capped %d -> %d Hz\n",
+                         orig, kPiMaxSimHz);
+        }
+    }
 
     Synthesizer::AudioParameters audioParams = sim->synthesizer().getAudioParameters();
     audioParams.inputSampleNoise = static_cast<float>(engine->getInitialJitter());
@@ -1202,6 +1224,12 @@ int main(int argc, char **argv) {
         "[headless] Engine: %s | audio: %d Hz period=%d | %s\n",
         engine->getName().c_str(), sampleRate, periodFrames,
         noDevice ? "no-device (WAV only)" : "device open");
+    if (piMode) {
+        std::fprintf(stderr,
+            "[PI-MODE] sim_freq=%d Hz  sr=%d Hz  period=%d  fps=30"
+            "  (low-power mode for Raspberry Pi)\n",
+            sim->getSimulationFrequency(), sampleRate, periodFrames);
+    }
     std::cerr << "[headless] Commands: throttle|pedal|brake|speed|setrpm"
                  " mode ignition|starter|gear|vgear autostart"
                  " tone backfire audio_debug status quit\n";
@@ -1218,10 +1246,12 @@ int main(int argc, char **argv) {
     using Clock   = std::chrono::steady_clock;
     using Seconds = std::chrono::duration<double>;
 
-    constexpr double TARGET_FPS = 60.0;
-    constexpr double FRAME_DT   = 1.0 / TARGET_FPS;
-    constexpr double DT_MIN     = 1.0 / 200.0;
-    constexpr double DT_MAX     = 1.0 / 30.0;
+    // Pi-mode: halve main-loop rate (30 Hz) to reduce per-frame overhead.
+    // DT_MAX relaxed so a 30 Hz frame isn't clamped by the old 33 ms ceiling.
+    const double TARGET_FPS = piMode ? 30.0 : 60.0;
+    const double FRAME_DT   = 1.0 / TARGET_FPS;
+    const double DT_MIN     = 1.0 / 200.0;
+    const double DT_MAX     = piMode ? (1.0 / 15.0) : (1.0 / 30.0);
 
     auto loopStart  = Clock::now();
     auto prevFrame  = loopStart;
@@ -1671,19 +1701,21 @@ int main(int argc, char **argv) {
                     if (!noDevice)
                         state.audioRing.write(drainBuf, drained);
 
-                    // Diagnostics
+                    // Diagnostics (per-sample pass skipped in pi-mode)
                     epochGenSamples += drained;
-                    for (int i = 0; i < drained; ++i) {
-                        const int16_t s = drainBuf[i];
-                        const float   v  = s * (1.0f / 32767.0f);
-                        const float   av = v < 0.0f ? -v : v;
-                        if (av > epochPeak) epochPeak = av;
-                        epochSumSq += v * v;
-                        if ((s >= 0) != (diagPrevSample >= 0)) ++epochZeroCross;
-                        diagPrevSample = s;
-                        epochHash = (epochHash << 5u) ^ (epochHash >> 27u)
-                                    ^ static_cast<uint32_t>(static_cast<uint16_t>(s));
-                        if (s >= 32767 || s <= -32767) ++epochSynthClips;
+                    if (!piMode) {
+                        for (int i = 0; i < drained; ++i) {
+                            const int16_t s = drainBuf[i];
+                            const float   v  = s * (1.0f / 32767.0f);
+                            const float   av = v < 0.0f ? -v : v;
+                            if (av > epochPeak) epochPeak = av;
+                            epochSumSq += v * v;
+                            if ((s >= 0) != (diagPrevSample >= 0)) ++epochZeroCross;
+                            diagPrevSample = s;
+                            epochHash = (epochHash << 5u) ^ (epochHash >> 27u)
+                                        ^ static_cast<uint32_t>(static_cast<uint16_t>(s));
+                            if (s >= 32767 || s <= -32767) ++epochSynthClips;
+                        }
                     }
                 }
             } while (drained == lastToRead && drainedTotal < drainMax);
