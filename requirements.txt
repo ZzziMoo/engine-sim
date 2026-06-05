@@ -1,0 +1,19 @@
+# Tesla Engine Sound Bridge — Python dependencies
+#
+# Install all:
+#   pip install -r requirements.txt
+#
+# Raspberry Pi / Linux note:
+#   SocketCAN is built into the kernel; no extra package needed.
+#   For USB-serial CAN adapters: also install pyserial
+#     pip install pyserial
+
+# CAN stack
+python-can>=4.2.0
+cantools>=39.0.0
+
+# Config file
+pyyaml>=6.0
+
+# UI (tkinter is bundled with CPython; install separately on minimal Linux images)
+# sudo apt install python3-tk

@@ -1,0 +1,71 @@
+# config.yaml — Tesla Engine Sound Bridge
+# ----------------------------------------
+# Edit this file to match your hardware and engine-sim setup.
+# All values are optional; see feeder.py DEFAULT_CONFIG for fallbacks.
+
+# ── CAN interface ─────────────────────────────────────────────────────────────
+can:
+  # Interface type:
+  #   socketcan  — SocketCAN on Linux / Raspberry Pi (default)
+  #   slcan      — Serial CAN adapter (CANable, etc.) on /dev/ttyUSB0
+  #   pcan       — PEAK PCAN-USB
+  #   kvaser     — Kvaser adapters
+  #   virtual    — python-can virtual bus for testing without hardware
+  interface: socketcan
+
+  # Channel name:
+  #   socketcan: can0, can1, vcan0
+  #   slcan:     /dev/ttyUSB0  (Linux)  or  COM3  (Windows)
+  #   pcan:      PCAN_USBBUS1
+  #   kvaser:    0
+  channel: can0
+
+  bitrate: 500000          # 500 kbps — standard Tesla CAN
+
+  # Path to the DBC file.  Relative paths are resolved from the project root.
+  # Copy Model3CAN.dbc into this folder, or set an absolute path.
+  dbc_path: Model3CAN.dbc
+
+# ── Signal mapping ────────────────────────────────────────────────────────────
+# Maps roles to DBC signal names.  Change only if your DBC uses different names.
+signal_map:
+  vehicle_speed:  DI_vehicleSpeed     # kph  (message 0x257 / ID 599)
+  throttle_pedal: DI_accelPedalPos    # 0-100 %  (message 0x118 / ID 280)
+  brake_pedal:    DI_brakePedalState  # enum OFF/ON  (message 0x118 / ID 280)
+  gear:           DI_gear             # enum P/R/N/D  (message 0x118 / ID 280)
+
+# Optional: continuous-valued brake pedal travel (overrides brake_pedal boolean)
+# Uncomment and calibrate max_mm to your vehicle's brake travel range.
+# analog_brake:
+#   signal:  IBST_sInputRodDriver    # 0–47 mm  (message 0x39D / ID 925)
+#   max_mm:  20.0                    # mm at which brake = 1.0
+
+# ── engine-sim-headless settings ─────────────────────────────────────────────
+engine_sim:
+  # Path to the executable.  Relative to the project root.
+  # On Windows: build/engine-sim-headless.exe
+  # On Linux / Pi: build/engine-sim-headless
+  executable: build/engine-sim-headless.exe   # adjust for your OS
+
+  # Default engine script (relative to assets/engines/)
+  engine_script: atg-video-2/03_2jz.mr
+
+  port: 9999                  # UDP port engine-sim-headless listens on
+
+  startup_mode: hybrid        # hybrid (virtual gears) | throttle (raw pedal)
+  virtual_gears: true         # send virtual_gears on at startup
+
+# ── Feeder settings ───────────────────────────────────────────────────────────
+feeder:
+  update_hz: 20.0             # how often to send UDP control to engine-sim (Hz)
+  can_timeout_sec: 2.0        # seconds without CAN data before failsafe (pedal -> 0)
+  manual_test: false          # set true to use generated data instead of CAN
+  log_level: INFO             # DEBUG | INFO | WARNING | ERROR
+
+# ── Manual test mode ──────────────────────────────────────────────────────────
+# Used when feeder.manual_test = true  or  --manual-test on CLI.
+manual_test:
+  mode: ramp          # ramp (0->100 mph cycle) | sine (smooth oscillation) | hold
+  speed_mph: 60.0     # hold mode: fixed speed
+  pedal_pct: 40.0     # hold mode: fixed pedal %
+  brake: 0.0          # hold mode: fixed brake
