@@ -1227,9 +1227,16 @@ int main(int argc, char **argv) {
     auto prevFrame  = loopStart;
     auto benchEpoch = loopStart;
 
-    double cpuPrev      = processCpuSeconds();
-    long long stepCount = 0;
-    int underrunsPrev   = 0;
+    long long stepCount   = 0;
+    int       underrunsPrev = 0;
+
+    // Per-interval timing accumulators for benchmark (wall-clock; cross-platform).
+    // sim  = physics step only.  audio = drain loop + mixing + ring write.
+    double    benchSimTimeTotal   = 0.0;   // ms
+    double    benchSimTimeMax     = 0.0;   // ms
+    double    benchAudioTimeTotal = 0.0;   // ms
+    double    benchAudioTimeMax   = 0.0;   // ms
+    long long benchFrameCount     = 0;
 
     bool starterReleased = !state.autostart.load();
 
@@ -1401,10 +1408,17 @@ int main(int argc, char **argv) {
         // ------------------------------------------------------------------
         // Physics step
         // ------------------------------------------------------------------
+        const auto tSimStart = Clock::now();
         sim->startFrame(wallDt);
         while (sim->simulateStep()) {}
         sim->endFrame();
         stepCount += sim->getFrameIterationCount();
+        if (benchmark) {
+            const double tSimMs = Seconds(Clock::now() - tSimStart).count() * 1000.0;
+            benchSimTimeTotal += tSimMs;
+            if (tSimMs > benchSimTimeMax) benchSimTimeMax = tSimMs;
+            ++benchFrameCount;
+        }
 
         // ------------------------------------------------------------------
         // Rate-limited crankshaft omega forcing (Hybrid / Rpm modes only).
@@ -1549,6 +1563,7 @@ int main(int argc, char **argv) {
         // ------------------------------------------------------------------
         // Audio: either engine synthesis or tone generator
         // ------------------------------------------------------------------
+        const auto tAudioStart = Clock::now();
         if (state.toneActive.load(std::memory_order_relaxed)) {
             // Tone mode: generate sine wave directly to ring and/or WAV.
             // Keep ring at ~50% capacity; let synth buffer stay full (it pauses).
@@ -1674,6 +1689,12 @@ int main(int argc, char **argv) {
             } while (drained == lastToRead && drainedTotal < drainMax);
         }
 
+        if (benchmark) {
+            const double tAudioMs = Seconds(Clock::now() - tAudioStart).count() * 1000.0;
+            benchAudioTimeTotal += tAudioMs;
+            if (tAudioMs > benchAudioTimeMax) benchAudioTimeMax = tAudioMs;
+        }
+
         // ------------------------------------------------------------------
         // Drain capture ring to live WAV (post-ring, exactly what callback sent)
         // ------------------------------------------------------------------
@@ -1765,19 +1786,35 @@ int main(int argc, char **argv) {
                 const double simFreq = static_cast<double>(sim->getSimulationFrequency());
                 const double rtf     = (benchElapsed > 0.0)
                     ? (stepCount / simFreq) / benchElapsed : 0.0;
-                const double cpuNow  = processCpuSeconds();
-                const double cpuPct  = (benchElapsed > 0.0)
-                    ? (cpuNow - cpuPrev) / benchElapsed * 100.0 : 0.0;
-                cpuPrev = cpuNow;
+
+                const double simAvg    = (benchFrameCount > 0)
+                    ? benchSimTimeTotal   / static_cast<double>(benchFrameCount) : 0.0;
+                const double audioAvg  = (benchFrameCount > 0)
+                    ? benchAudioTimeTotal / static_cast<double>(benchFrameCount) : 0.0;
+                // CPU budget: (sim + audio) ms spent per 1000 ms wall time
+                const double cpuMsPerSec = (benchElapsed > 0.0)
+                    ? (benchSimTimeTotal + benchAudioTimeTotal) / benchElapsed : 0.0;
+                const double budget = cpuMsPerSec / 10.0; // ms/s ÷ 1000 × 100
+
                 const int undrEpoch = state.underruns.load() - underrunsPrev;
                 underrunsPrev = state.underruns.load();
                 std::fprintf(stderr,
-                    "[BENCH] rtf=%.3f underruns=%d ring=%d cpu=%.1f%% steps/s=%lld\n",
-                    rtf, undrEpoch, state.audioRing.available(), cpuPct,
-                    static_cast<long long>(benchElapsed > 0.0
-                        ? stepCount / benchElapsed : 0));
-                benchEpoch = now;
-                stepCount  = 0;
+                    "[BENCH] rtf=%.3f underruns=%d ring=%d"
+                    " sim_avg=%.3fms sim_max=%.3fms"
+                    " audio_avg=%.3fms audio_max=%.3fms"
+                    " cpu_ms/s=%.1f budget=%.1f%%\n",
+                    rtf, undrEpoch, state.audioRing.available(),
+                    simAvg,    benchSimTimeMax,
+                    audioAvg,  benchAudioTimeMax,
+                    cpuMsPerSec, budget);
+
+                benchEpoch           = now;
+                stepCount            = 0;
+                benchSimTimeTotal    = 0.0;
+                benchSimTimeMax      = 0.0;
+                benchAudioTimeTotal  = 0.0;
+                benchAudioTimeMax    = 0.0;
+                benchFrameCount      = 0;
             }
         }
 
