@@ -19,6 +19,12 @@ import os
 import pathlib
 import platform
 import subprocess
+
+_SYS = platform.system()   # 'Darwin' | 'Linux' | 'Windows'
+_DEFAULT_IFACE   = "socketcan"          if _SYS == "Linux"  else (
+                   "slcan"              if _SYS == "Darwin" else "slcan")
+_DEFAULT_CHANNEL = "can0"              if _SYS == "Linux"  else (
+                   "/dev/tty.usbmodem0" if _SYS == "Darwin" else "COM3")
 import sys
 import time
 import tkinter as tk
@@ -158,12 +164,13 @@ class App:
         r0 = tk.Frame(cp)
         r0.pack(fill=tk.X)
         tk.Label(r0, text="Interface:", anchor="w", width=9).pack(side=tk.LEFT)
-        self.sv_iface = tk.StringVar(value="socketcan")
+        self.sv_iface = tk.StringVar(value=_DEFAULT_IFACE)
         ttk.Combobox(r0, textvariable=self.sv_iface, width=10,
-                     values=["socketcan", "slcan", "pcan", "kvaser", "virtual"],
+                     values=["slcan", "gs_usb", "pcan", "kvaser",
+                             "socketcan", "cantact", "virtual"],
                      state="readonly").pack(side=tk.LEFT, padx=(0, 8))
         tk.Label(r0, text="Channel:", anchor="w").pack(side=tk.LEFT)
-        self.sv_channel = tk.StringVar(value="can0")
+        self.sv_channel = tk.StringVar(value=_DEFAULT_CHANNEL)
         tk.Entry(r0, textvariable=self.sv_channel, width=12).pack(side=tk.LEFT, padx=(0, 8))
         tk.Label(r0, text="Bitrate:", anchor="w").pack(side=tk.LEFT)
         self.sv_bitrate = tk.StringVar(value="500000")
@@ -267,8 +274,8 @@ class App:
 
     def _restore_config(self) -> None:
         can = self.cfg.get("can", {})
-        self.sv_iface.set(can.get("interface", "socketcan"))
-        self.sv_channel.set(can.get("channel", "can0"))
+        self.sv_iface.set(can.get("interface", _DEFAULT_IFACE))
+        self.sv_channel.set(can.get("channel",    _DEFAULT_CHANNEL))
         self.sv_bitrate.set(str(can.get("bitrate", 500000)))
         self.sv_dbc.set(can.get("dbc_path", "Model3CAN.dbc"))
 
@@ -303,7 +310,8 @@ class App:
     def _browse_exe(self) -> None:
         path = filedialog.askopenfilename(
             title="Select engine-sim-headless",
-            filetypes=[("Executable", "*.exe engine-sim-headless"), ("All", "*.*")])
+            filetypes=[("Executable", "*.exe" if _SYS == "Windows" else "*"),
+                       ("All", "*.*")])
         if path:
             self.sv_exe.set(path)
 

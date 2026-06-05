@@ -2,18 +2,36 @@
 #
 # Install all:
 #   pip install -r requirements.txt
-#
-# Raspberry Pi / Linux note:
-#   SocketCAN is built into the kernel; no extra package needed.
-#   For USB-serial CAN adapters: also install pyserial
-#     pip install pyserial
 
 # CAN stack
 python-can>=4.2.0
 cantools>=39.0.0
 
+# Required for slcan (USB-serial CAN adapters — most common on macOS)
+pyserial>=3.5
+
 # Config file
 pyyaml>=6.0
 
-# UI (tkinter is bundled with CPython; install separately on minimal Linux images)
-# sudo apt install python3-tk
+# ── Platform notes ────────────────────────────────────────────────────────────
+#
+# macOS
+#   tkinter: bundled with the python.org installer.
+#            Homebrew Python: brew install python-tk
+#
+#   slcan (CANable 1.x / slcan firmware) — no driver needed on macOS 11+
+#     Find your device:  ls /dev/tty.usb* /dev/cu.usb*
+#
+#   gs_usb (CANable 2.0 / candleLight firmware) — no driver needed
+#     pip install pyusb libusb1
+#
+#   PCAN-USB: download PEAK macOS driver from peak-system.com
+#
+# Linux / Raspberry Pi
+#   SocketCAN is in the kernel; no extra package needed.
+#   Bring up:  sudo ip link set can0 up type can bitrate 500000
+#   tkinter:   sudo apt install python3-tk
+#
+# Windows
+#   slcan: pyserial is already listed above
+#   PCAN: PEAK Windows driver from peak-system.com

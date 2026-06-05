@@ -1,29 +1,44 @@
 # config.yaml — Tesla Engine Sound Bridge
 # ----------------------------------------
 # Edit this file to match your hardware and engine-sim setup.
-# All values are optional; see feeder.py DEFAULT_CONFIG for fallbacks.
+# All values are optional; feeder.py DEFAULT_CONFIG provides fallbacks.
 
 # ── CAN interface ─────────────────────────────────────────────────────────────
 can:
-  # Interface type:
-  #   socketcan  — SocketCAN on Linux / Raspberry Pi (default)
-  #   slcan      — Serial CAN adapter (CANable, etc.) on /dev/ttyUSB0
-  #   pcan       — PEAK PCAN-USB
-  #   kvaser     — Kvaser adapters
-  #   virtual    — python-can virtual bus for testing without hardware
-  interface: socketcan
+  # Interface type — pick the one matching your CAN adapter:
+  #
+  #   slcan      Serial CAN adapter (CANable 1.x / slcan firmware)
+  #              macOS:   /dev/tty.usbmodem*  or  /dev/cu.usbserial*
+  #              Linux:   /dev/ttyUSB0  or  /dev/ttyACM0
+  #              Windows: COM3 (or whichever COM port Windows assigns)
+  #
+  #   gs_usb     Geschwister-Schneider USB CAN (CANable 2.0 / candleLight
+  #              firmware).  No extra driver needed on macOS or Linux.
+  #              channel: 0  (integer index, not a device path)
+  #
+  #   socketcan  Linux / Raspberry Pi kernel CAN.  NOT available on macOS.
+  #              channel: can0  (bring up with: ip link set can0 up type can bitrate 500000)
+  #
+  #   pcan       PEAK PCAN-USB.  Requires PEAK driver (macOS driver available
+  #              from peak-system.com).  channel: PCAN_USBBUS1
+  #
+  #   kvaser     Kvaser hardware + driver.  channel: 0
+  #
+  #   virtual    python-can virtual bus — no hardware, for development/CI
+  #              channel: ""
+  interface: slcan
 
-  # Channel name:
-  #   socketcan: can0, can1, vcan0
-  #   slcan:     /dev/ttyUSB0  (Linux)  or  COM3  (Windows)
-  #   pcan:      PCAN_USBBUS1
-  #   kvaser:    0
-  channel: can0
+  # Channel — depends on interface type (see above).
+  # Find your macOS serial port with:  ls /dev/tty.usb* /dev/cu.usb*
+  # Common macOS values:
+  #   /dev/tty.usbmodem0    (USB CDC — CANable, etc.)
+  #   /dev/cu.usbserial-0   (FTDI-based adapters)
+  channel: /dev/tty.usbmodem0
 
   bitrate: 500000          # 500 kbps — standard Tesla CAN
 
   # Path to the DBC file.  Relative paths are resolved from the project root.
-  # Copy Model3CAN.dbc into this folder, or set an absolute path.
+  # Copy Model3CAN.dbc into this folder, or supply an absolute path.
   dbc_path: Model3CAN.dbc
 
 # ── Signal mapping ────────────────────────────────────────────────────────────
@@ -34,7 +49,7 @@ signal_map:
   brake_pedal:    DI_brakePedalState  # enum OFF/ON  (message 0x118 / ID 280)
   gear:           DI_gear             # enum P/R/N/D  (message 0x118 / ID 280)
 
-# Optional: continuous-valued brake pedal travel (overrides brake_pedal boolean)
+# Optional: continuous-valued brake pedal travel (overrides brake_pedal boolean).
 # Uncomment and calibrate max_mm to your vehicle's brake travel range.
 # analog_brake:
 #   signal:  IBST_sInputRodDriver    # 0–47 mm  (message 0x39D / ID 925)
@@ -42,18 +57,18 @@ signal_map:
 
 # ── engine-sim-headless settings ─────────────────────────────────────────────
 engine_sim:
-  # Path to the executable.  Relative to the project root.
-  # On Windows: build/engine-sim-headless.exe
-  # On Linux / Pi: build/engine-sim-headless
-  executable: build/engine-sim-headless.exe   # adjust for your OS
+  # Path to the compiled engine-sim-headless binary.
+  # macOS / Linux: build/engine-sim-headless    (no extension)
+  # Windows:       build/engine-sim-headless.exe
+  executable: build/engine-sim-headless
 
-  # Default engine script (relative to assets/engines/)
+  # Default engine script shown in the launcher (relative to assets/engines/)
   engine_script: atg-video-2/03_2jz.mr
 
   port: 9999                  # UDP port engine-sim-headless listens on
 
   startup_mode: hybrid        # hybrid (virtual gears) | throttle (raw pedal)
-  virtual_gears: true         # send virtual_gears on at startup
+  virtual_gears: true         # send "virtual_gears on" at startup
 
 # ── Feeder settings ───────────────────────────────────────────────────────────
 feeder:
@@ -63,7 +78,7 @@ feeder:
   log_level: INFO             # DEBUG | INFO | WARNING | ERROR
 
 # ── Manual test mode ──────────────────────────────────────────────────────────
-# Used when feeder.manual_test = true  or  --manual-test on CLI.
+# Used when feeder.manual_test = true  or  --manual-test flag on CLI.
 manual_test:
   mode: ramp          # ramp (0->100 mph cycle) | sine (smooth oscillation) | hold
   speed_mph: 60.0     # hold mode: fixed speed

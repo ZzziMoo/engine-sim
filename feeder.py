@@ -11,7 +11,12 @@ Standalone:
     python feeder.py                          # load config.yaml, live CAN
     python feeder.py --manual-test            # ramp profile, no hardware
     python feeder.py --manual-test --mode sine|hold|ramp
-    python feeder.py --channel can0 --interface socketcan
+    # macOS — USB-serial CAN adapter (slcan):
+    python feeder.py --interface slcan --channel /dev/tty.usbmodem0
+    # macOS — CANable/candleLight USB adapter (gs_usb, no driver needed):
+    python feeder.py --interface gs_usb --channel 0
+    # Linux / Raspberry Pi:
+    python feeder.py --interface socketcan --channel can0
     python feeder.py --config custom.yaml
 
 Library (from main.py):
@@ -52,13 +57,23 @@ try:
 except ImportError:
     _HAS_YAML = False
 
+import platform as _platform
+
 _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+_SYS = _platform.system()   # 'Darwin' | 'Linux' | 'Windows'
+
+# Platform-appropriate CAN defaults
+# macOS has no SocketCAN — slcan (USB-serial) or gs_usb (CANable) are typical.
+_DEFAULT_IFACE   = "socketcan"          if _SYS == "Linux"  else (
+                   "slcan"              if _SYS == "Darwin" else "slcan")
+_DEFAULT_CHANNEL = "can0"              if _SYS == "Linux"  else (
+                   "/dev/tty.usbmodem0" if _SYS == "Darwin" else "COM3")
 
 # ── default configuration ─────────────────────────────────────────────────────
 DEFAULT_CONFIG: Dict[str, Any] = {
     "can": {
-        "interface": "socketcan",   # socketcan | slcan | pcan | kvaser | virtual
-        "channel": "can0",          # can0, /dev/ttyUSB0, PCAN_USBBUS1 …
+        "interface": _DEFAULT_IFACE,    # socketcan (Linux) | slcan | gs_usb | pcan | kvaser
+        "channel": _DEFAULT_CHANNEL,    # can0 (Linux) | /dev/tty.usbmodem0 (Mac) | COM3 (Win)
         "bitrate": 500000,
         "dbc_path": "Model3CAN.dbc",
     },
@@ -303,8 +318,8 @@ class FeederCore:
             return
 
         can_cfg = self._cfg.get("can", {})
-        bustype = can_cfg.get("interface", "socketcan")
-        channel = can_cfg.get("channel", "can0")
+        bustype = can_cfg.get("interface", _DEFAULT_IFACE)
+        channel = can_cfg.get("channel",    _DEFAULT_CHANNEL)
         bitrate = int(can_cfg.get("bitrate", 500000))
 
         self._log.info(f"Opening CAN: bustype={bustype} channel={channel} bitrate={bitrate}")
@@ -630,9 +645,11 @@ def main() -> None:
     parser.add_argument("--mode",      choices=["ramp", "sine", "hold"],
                         default=None, help="Manual test drive profile")
     parser.add_argument("--interface", default=None,
-                        help="CAN interface type (socketcan, slcan, pcan, kvaser, virtual)")
+                        help="CAN interface type: slcan|gs_usb|pcan|kvaser|socketcan|virtual"
+                             f" (platform default: {_DEFAULT_IFACE})")
     parser.add_argument("--channel",   default=None,
-                        help="CAN channel (can0, /dev/ttyUSB0, …)")
+                        help="CAN channel: /dev/tty.usbmodem0 (Mac), can0 (Linux), COM3 (Win)"
+                             f" (platform default: {_DEFAULT_CHANNEL})")
     parser.add_argument("--bitrate",   type=int, default=None,
                         help="CAN bitrate in bps")
     parser.add_argument("--dbc",       default=None,
